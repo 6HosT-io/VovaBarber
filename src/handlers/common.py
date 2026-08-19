@@ -313,28 +313,56 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
 async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     lang = get_lang(message)
-
     text = (
-        "Хорошо, текущая запись/действие отменено.\n"
-        "Если нужно записаться заново — нажмите «Записаться» или /book."
+        "Хорошо, текущее действие отменено.\n"
+        "Чтобы отменить уже подтверждённую запись — /cancel_booking"
         if lang == "ru"
-        else "Labi, pašreizējā darbība atcelta.\n"
-        "Ja vajag pierakstīties no jauna — nospiediet «Pierakstīties» vai /book."
+        else "Labi, darbība atcelta.\n"
+        "Lai atceltu apstiprinātu pierakstu — /cancel_booking"
     )
     await message.answer(text, reply_markup=main_menu_kb(lang))
 
-    # Notify group
+
+@router.message(Command("cancel_booking"))
+async def cmd_cancel_booking(message: Message, bot: Bot):
+    """Client cancels an active confirmed appointment."""
+    from src.services import settings_store as store
+    lang = get_lang(message)
+    active = store.get_active_bookings_for_user(message.from_user.id)
+    if not active:
+        await message.answer(
+            "Нет активных записей для отмены." if lang == "ru"
+            else "Nav aktīvu pierakstu."
+        )
+        return
+    # Cancel the nearest / latest active
+    b = active[-1]
+    store.cancel_booking(b["id"], by="client")
+    try:
+        from src.services import calendar as gcal
+        eid = b.get("calendar_event_id")
+        if eid:
+            gcal.delete_event(eid)
+    except Exception:
+        pass
+    await message.answer(
+        f"❌ Запись на <b>{b.get('date')}</b> отменена.\n"
+        f"Можно записаться снова через /book."
+        if lang == "ru"
+        else f"❌ Pieraksts uz <b>{b.get('date')}</b> atcelts."
+    )
     if ADMIN_GROUP_ID:
-        user = message.from_user
         try:
-            from src.services import settings_store as store
-            client_line = store.format_client_line(user.id, user.full_name)
+            line = store.format_client_line(message.from_user.id, message.from_user.full_name)
             await bot.send_message(
                 ADMIN_GROUP_ID,
-                f"❌ Отмена\n{client_line}",
+                f"❌ Клиент отменил подтверждённую запись\n"
+                f"{line}\n"
+                f"Дата: {b.get('date')}\n"
+                f"Комментарий: {b.get('comment')}",
             )
         except Exception as e:
-            logger.error(f"Failed to notify cancel: {e}")
+            logger.error(f"cancel_booking group notify: {e}")
 
 
 # ---------- Prices / History / Contact / Help ----------
@@ -443,12 +471,19 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
 
     pending = store.pop_pending_booking(client_id)
     cal_note = ""
+    booking_id = ""
     if pending:
-        # Record service for "Last time used services"
+        booking_id = store.add_confirmed_booking(
+            client_id,
+            pending.get("date") or "",
+            pending.get("comment") or "",
+            client_name=pending.get("client_name") or "",
+        )
         store.add_service_history(
             client_id,
             pending.get("comment") or "услуга",
             pending.get("date") or "",
+            booking_id=booking_id,
         )
         name = pending.get("client_name") or "Клиент"
         contact = store.get_client_contact_name(client_id)
@@ -467,9 +502,9 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
         )
         if event_id:
             cal_note = "\n📅 Добавлено в Google Calendar"
+            store.update_booking(booking_id, calendar_event_id=event_id)
         elif gcal.is_configured():
             cal_note = "\n⚠️ Calendar: не удалось создать событие"
-        # if not configured — silent, no note
 
     try:
         location = store.get_location()
@@ -477,10 +512,20 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             client_id,
             f"✅ Ваша заявка подтверждена! Ждём вас.\n"
             f"📍 {location}\n"
-            f"Если что-то случится, вот телефон: +371 29985759",
+            f"Если что-то случится, вот телефон: +371 29985759\n\n"
+            f"Отменить запись: /cancel_booking",
         )
+        kb = None
+        if booking_id:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❌ Отменить эту запись",
+                    callback_data=f"adm:cancel:{booking_id}",
+                )],
+            ])
         await callback.message.edit_text(
-            callback.message.text + f"\n\n✅ <b>Подтверждено</b>{cal_note}"
+            callback.message.text + f"\n\n✅ <b>Подтверждено</b>{cal_note}",
+            reply_markup=kb,
         )
     except Exception as e:
         await callback.answer(f"Не удалось написать клиенту: {e}", show_alert=True)
@@ -502,6 +547,37 @@ async def admin_reject(callback: CallbackQuery, bot: Bot):
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
     await callback.answer("Клиент уведомлён")
+
+
+@router.callback_query(F.data.startswith("adm:cancel:"))
+async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
+    """Barber cancels an already confirmed appointment."""
+    booking_id = callback.data.split(":")[2]
+    from src.services import settings_store as store
+    b = store.cancel_booking(booking_id, by="barber")
+    if not b:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    # optional calendar delete
+    try:
+        from src.services import calendar as gcal
+        eid = b.get("calendar_event_id")
+        if eid:
+            gcal.delete_event(eid)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            int(b["user_id"]),
+            f"❌ К сожалению, запись на <b>{b.get('date')}</b> отменена барбером.\n"
+            f"Можно выбрать другое время через /book.",
+        )
+    except Exception as e:
+        logger.error(f"notify client cancel failed: {e}")
+    await callback.message.edit_text(
+        callback.message.text + "\n\n❌ <b>Запись отменена барбером</b>"
+    )
+    await callback.answer("Запись отменена")
 
 
 @router.callback_query(F.data.startswith("adm:setname:"))
@@ -543,6 +619,58 @@ async def admin_setname_save(message: Message, state: FSMContext):
         f"В следующих заявках будет:\n"
         f"📱 В контактах: <b>{name}</b>"
     )
+
+
+
+# ---------- Reminder buttons ----------
+
+@router.callback_query(F.data.startswith("rem:yes:"))
+async def rem_yes(callback: CallbackQuery):
+    booking_id = callback.data.split(":")[2]
+    from src.services import settings_store as store
+    store.update_booking(booking_id, client_confirmed=True, client_thinking=False)
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ <b>Спасибо! Ждём вас.</b>"
+    )
+    await callback.answer("Запись подтверждена")
+
+
+@router.callback_query(F.data.startswith("rem:think:"))
+async def rem_think(callback: CallbackQuery):
+    booking_id = callback.data.split(":")[2]
+    from src.services import settings_store as store
+    store.update_booking(booking_id, client_thinking=True)
+    # Morning reminder still comes
+    await callback.message.edit_text(
+        callback.message.text + "\n\n🤔 Хорошо, напомним ещё раз утром."
+    )
+    await callback.answer("Ок, напомним утром")
+
+
+@router.callback_query(F.data.startswith("rem:move:"))
+async def rem_move(callback: CallbackQuery, bot: Bot):
+    booking_id = callback.data.split(":")[2]
+    from src.services import settings_store as store
+    b = store.get_booking(booking_id)
+    store.cancel_booking(booking_id, by="client")  # reschedule = cancel old slot
+    await callback.message.edit_text(
+        callback.message.text + "\n\n📅 Напишите, пожалуйста, новое время через /book — барбер увидит."
+    )
+    await callback.answer("Ок")
+    # Notify admin group
+    group = os.getenv("ADMIN_GROUP_ID")
+    if group and b:
+        try:
+            line = store.format_client_line(int(b["user_id"]), b.get("client_name"))
+            await bot.send_message(
+                group,
+                f"📅 Клиент просит перенести запись\n"
+                f"{line}\n"
+                f"Дата: {b.get('date')}\n"
+                f"Комментарий: {b.get('comment')}",
+            )
+        except Exception as e:
+            logger.error(f"rem:move group notify failed: {e}")
 
 
 # ---------- Free text (questions) → group ----------
