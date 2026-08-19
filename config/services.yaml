@@ -1,0 +1,36 @@
+services:
+  - id: men_haircut
+    name_ru: "Мужская стрижка"
+    name_lv: "Vīriešu griezums"
+    price: 20
+    duration_min: 30
+    is_active: true
+
+  - id: full_package_men
+    name_ru: "Полный пакет (стрижка + борода)"
+    name_lv: "Pilnais komplekts (griezums + bārda)"
+    price: 25
+    duration_min: 45
+    is_active: true
+
+  - id: beard_trim
+    name_ru: "Стрижка бороды"
+    name_lv: "Bārdas griešana"
+    price: 10
+    duration_min: 15
+    is_active: true
+
+  - id: women_haircut
+    name_ru: "Женская стрижка"
+    name_lv: "Sieviešu griezums"
+    price: 30
+    duration_min: 45
+    is_active: true
+
+  - id: women_paint_styling
+    name_ru: "Окрашивание и укладка"
+    name_lv: "Krāsošana un veidošana"
+    price: 35
+    duration_min: 75
+    is_active: true
+    note: "60–90 min depending on complexity"

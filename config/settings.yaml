@@ -1,0 +1,29 @@
+working_hours:
+  weekdays:
+    - start: "10:00"
+      end: "12:00"
+    - start: "14:00"
+      end: "22:00"
+  saturday:
+    - start: "10:00"
+      end: "22:00"
+  sunday: []   # closed by default
+
+timezone: "Europe/Riga"
+
+reminder:
+  hours_before: 24
+  morning_time: "09:00"
+
+location: "Jasmuižas iela 9, Latgales priekšpilsēta, Rīga, LV-1021"
+
+broader_slots:
+  - id: morning
+    name_ru: "Утро (10:00–12:00)"
+    name_lv: "Rīts (10:00–12:00)"
+  - id: afternoon
+    name_ru: "День (14:00–17:00)"
+    name_lv: "Diena (14:00–17:00)"
+  - id: evening
+    name_ru: "Вечер (17:00–22:00)"
+    name_lv: "Vakars (17:00–22:00)"

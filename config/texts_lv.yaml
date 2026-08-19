@@ -1,0 +1,57 @@
+start: |
+  Sveiki! 👋
+  Esmu frizētavas bots.
+  Šeit var ātri pierakstīties, apskatīt vēsturi un uzdot jautājumu.
+
+main_menu:
+  book: "📅 Pierakstīties"
+  history: "📋 Pierakstu vēsture"
+  prices: "💰 Cenas"
+  contact: "📞 Sazināties"
+  language: "🌐 Language / Valoda"
+
+choose_day: "Izvēlieties dienu:"
+today: "Šodien"
+tomorrow: "Rīt"
+day_after: "Parīt"
+
+choose_slot: "Izvēlieties ērtu laiku:"
+free_text_prompt: "Uzrakstiet vēlamo laiku vai komentāru (piemēram: «pēc 16:00» vai «ap 11»):"
+
+choose_service: "Izvēlieties pakalpojumu:"
+
+ask_name: "Kā jūs sauc?"
+ask_phone: "Jūsu tālruņa numurs (saziņai):"
+
+request_sent: |
+  ✅ Pieprasījums nosūtīts!
+  Frizieris drīz apstiprinās vai piedāvās citu laiku.
+  Mēs rakstīsim jums šeit.
+
+slot_taken: |
+  Diemžēl šis laiks jau ir aizņemts 😔
+  Izvēlieties citu dienu vai laiku.
+
+reminder_24h: |
+  Sveiki! ✂️
+  Atgādinām par pierakstu *rīt* plkst. *{time}*.
+  Vai viss spēkā? Lūdzu, apstipriniet.
+
+reminder_morning: |
+  Labrīt! ☀️
+  Šodien jums ir pieraksts plkst. *{time}*.
+  Gaidām jūs!
+  Adrese: {location}
+
+confirm_buttons:
+  yes: "✅ Jā, būšu"
+  no: "❌ Vajag pārcelt"
+
+admin_new_request: |
+  🆕 Jauns pieprasījums #{id}
+  Klients: {name}
+  Tālrunis: {phone}
+  Pakalpojums: {service}
+  Diena: {day}
+  Vēlme: {pref}
+  Komentārs: {comment}

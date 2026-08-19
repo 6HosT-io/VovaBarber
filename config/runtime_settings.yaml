@@ -1,0 +1,48 @@
+welcome_ru: 'Запись к Лучшему Барберу, Парикмахеру и Другу -  без звонков и ожидания!
+
+
+  🗓️ Выберите день (сегодня / завтра / послезавтра)
+
+  ⌚️Укажите удобное время
+
+  💆🏼 Выберите услугу
+
+  ☑️ Получите подтверждение от барбера
+
+
+  💈Адрес: Jasmuižas iela 9, Rīga
+
+  Языки: русский и латышский
+
+
+  Просто нажмите Start и выбирайте что актуально.
+
+
+  Важно: Бот отправляет напоминания за 24 часа до резервации и в тот же день. Если
+  подтвердите в первый раз - утром того же дня оповещения не будет.'
+welcome_lv: 'Reģistrējieties pie labākā bārddziņa, friziera un drauga – bez zvaniem
+  un gaidīšanas!
+
+
+  🗓️ Izvēlieties dienu (šodien / rīt / parīt)
+
+  ⌚️ Norādiet jums ērtu laiku
+
+  💆🏼 Izvēlieties pakalpojumu
+
+  ☑️ Saņemiet apstiprinājumu no bārddziņa
+
+
+  💈 Adrese: Jasmuižas iela 9, Rīga
+
+  Valodas: krievu un latviešu
+
+
+  Vienkārši nospiediet „Sākt” un izvēlieties to, kas jums ir aktuāli.
+
+
+  Svarīgi: Bots nosūta atgādinājumus 24 stundas pirms rezervācijas un tajā pašā dienā.
+  Ja apstiprināsiet pirmo reizi, tajā pašā rītā atgādinājums netiks nosūtīts.'
+client_names:
+  '1361872676': Elias
+blocked_days: []
