@@ -80,10 +80,31 @@ def get_welcome_text(lang: str = "ru") -> str:
     key = f"welcome_{lang}"
     if key in runtime:
         return runtime[key]
-    # fallback short defaults
     if lang == "lv":
-        return "Sveiki! Esmu frizētavas bots. Šeit var ātri pierakstīties."
-    return "Привет! Я бот барбершопа. Здесь можно быстро записаться."
+        return (
+            "Reģistrējieties pie labākā bārddziņa, friziera un drauga — bez zvaniem un gaidīšanas!\n\n"
+            "🗓️ Izvēlieties dienu (šodien / rīt / parīt)\n"
+            "⌚️ Norādiet jums ērtu laiku\n"
+            "💇 Izvēlieties pakalpojumu\n"
+            "☑️ Saņemiet apstiprinājumu no bārddziņa\n\n"
+            "💈 Adrese: Jasmuižas iela 9, Rīga\n"
+            "Valodas: krievu un latviešu\n\n"
+            "Vienkārši nospiediet Start un izvēlieties to, kas jums ir aktuāli.\n\n"
+            "Svarīgi: bots nosūta atgādinājumus 24 stundas pirms rezervācijas un tajā pašā dienā. "
+            "Ja apstiprināsiet pirmo reizi, tajā pašā rītā atgādinājums netiks nosūtīts."
+        )
+    return (
+        "Запись к Лучшему Барберу, Парикмахеру и Другу — без звонков и ожидания!\n\n"
+        "🗓️ Выберите день (сегодня / завтра / послезавтра)\n"
+        "⌚️ Укажите удобное время\n"
+        "💇 Выберите услугу\n"
+        "☑️ Получите подтверждение от барбера\n\n"
+        "💈 Адрес: Jasmuižas iela 9, Rīga\n"
+        "Языки: русский и латышский\n\n"
+        "Просто нажмите Start и выбирайте, что актуально.\n\n"
+        "Важно: бот отправляет напоминания за 24 часа до записи и в тот же день. "
+        "Если подтвердите в первый раз — утром того же дня оповещения не будет."
+    )
 
 
 def save_welcome_text(lang: str, text: str):
@@ -97,19 +118,19 @@ def get_reminder_texts() -> dict:
     return {
         "reminder_24h_ru": runtime.get(
             "reminder_24h_ru",
-            "Привет! ✂️ Напоминаем про запись завтра. Всё в силе?",
+            "Привет! ✂️ Напоминаем про вашу запись. Всё в силе?",
         ),
         "reminder_24h_lv": runtime.get(
             "reminder_24h_lv",
-            "Sveiki! ✂️ Atgādinām par pierakstu rīt. Vai viss spēkā?",
+            "Sveiki! ✂️ Atgādinām par jūsu pierakstu. Vai viss spēkā?",
         ),
         "reminder_morning_ru": runtime.get(
             "reminder_morning_ru",
-            "Доброе утро! Сегодня у вас запись. Ждём вас!",
+            "Доброе утро! ✂️ Сегодня у вас запись. Ждём вас!",
         ),
         "reminder_morning_lv": runtime.get(
             "reminder_morning_lv",
-            "Labrīt! Šodien jums ir pieraksts. Gaidām jūs!",
+            "Labrīt! ✂️ Šodien jums ir pieraksts. Gaidām jūs!",
         ),
     }
 
@@ -279,8 +300,8 @@ def pop_pending_booking(user_id: int) -> dict | None:
 
 # ---------- Client service history ----------
 
-def add_service_history(user_id: int, service_text: str, date_str: str = ""):
-    """Append a service visit for the client (newest last)."""
+def add_service_history(user_id: int, service_text: str, date_str: str = "", booking_id: str = ""):
+    """Append a service visit for the client (newest last). Only active entries count."""
     runtime = get_runtime()
     history = runtime.get("service_history", {}) or {}
     key = str(user_id)
@@ -290,21 +311,50 @@ def add_service_history(user_id: int, service_text: str, date_str: str = ""):
     entries.append({
         "service": (service_text or "").strip() or "—",
         "date": date_str or "",
+        "booking_id": booking_id or "",
+        "status": "active",
     })
-    # keep last 20
     history[key] = entries[-20:]
     runtime["service_history"] = history
     save_runtime(runtime)
 
 
+def cancel_service_history(user_id: int, booking_id: str = "", date_str: str = ""):
+    """Mark matching history entries as cancelled so they leave «last services»."""
+    runtime = get_runtime()
+    history = runtime.get("service_history", {}) or {}
+    key = str(user_id)
+    entries = history.get(key, [])
+    if not isinstance(entries, list):
+        return
+    for e in entries:
+        if e.get("status") == "cancelled":
+            continue
+        if booking_id and e.get("booking_id") == booking_id:
+            e["status"] = "cancelled"
+        elif not booking_id and date_str and e.get("date") == date_str:
+            e["status"] = "cancelled"
+            break  # cancel latest match for that date
+    # if no booking_id and no date — cancel the newest active
+    if not booking_id and not date_str:
+        for e in reversed(entries):
+            if e.get("status", "active") != "cancelled":
+                e["status"] = "cancelled"
+                break
+    history[key] = entries
+    runtime["service_history"] = history
+    save_runtime(runtime)
+
+
 def get_last_services(user_id: int, limit: int = 3) -> list:
-    """Return last N services, newest first."""
+    """Return last N *active* services, newest first."""
     runtime = get_runtime()
     history = runtime.get("service_history", {}) or {}
     entries = history.get(str(user_id), [])
     if not isinstance(entries, list):
         return []
-    return list(reversed(entries[-limit:]))
+    active = [e for e in entries if e.get("status", "active") != "cancelled"]
+    return list(reversed(active[-limit:]))
 
 
 def format_last_services_line(user_id: int, limit: int = 3) -> str:
@@ -320,3 +370,86 @@ def format_last_services_line(user_id: int, limit: int = 3) -> str:
         else:
             parts.append(svc)
     return "Last time used services: " + "; ".join(parts)
+
+
+# ---------- Confirmed bookings (for reminders) ----------
+
+def _new_booking_id() -> str:
+    import time
+    return str(int(time.time() * 1000))
+
+
+def add_confirmed_booking(
+    user_id: int,
+    date_str: str,
+    comment: str,
+    client_name: str = "",
+) -> str:
+    runtime = get_runtime()
+    bookings = runtime.get("confirmed_bookings", []) or []
+    bid = _new_booking_id()
+    bookings.append({
+        "id": bid,
+        "user_id": user_id,
+        "date": date_str,
+        "comment": comment,
+        "client_name": client_name,
+        "status": "confirmed",
+        "reminder_24h_sent": False,
+        "reminder_morning_sent": False,
+        "client_confirmed": False,
+        "client_thinking": False,
+    })
+    runtime["confirmed_bookings"] = bookings[-200:]
+    save_runtime(runtime)
+    return bid
+
+
+def cancel_booking(booking_id: str, by: str = "barber") -> dict | None:
+    """Cancel booking; remove from history; stop reminders. by: barber|client"""
+    b = update_booking(booking_id, status=f"cancelled_by_{by}")
+    if not b:
+        return None
+    cancel_service_history(int(b["user_id"]), booking_id=booking_id, date_str=b.get("date", ""))
+    return b
+
+
+def get_active_bookings_for_user(user_id: int) -> list:
+    return [
+        b for b in get_confirmed_bookings()
+        if int(b.get("user_id", 0)) == int(user_id)
+        and b.get("status") == "confirmed"
+    ]
+
+
+def get_confirmed_bookings() -> list:
+    runtime = get_runtime()
+    return list(runtime.get("confirmed_bookings", []) or [])
+
+
+def update_booking(booking_id: str, **fields) -> dict | None:
+    runtime = get_runtime()
+    bookings = runtime.get("confirmed_bookings", []) or []
+    found = None
+    for b in bookings:
+        if str(b.get("id")) == str(booking_id):
+            b.update(fields)
+            found = b
+            break
+    runtime["confirmed_bookings"] = bookings
+    save_runtime(runtime)
+    return found
+
+
+def mark_reminder_sent(booking_id: str, kind: str):
+    if kind == "24h":
+        update_booking(booking_id, reminder_24h_sent=True)
+    elif kind == "morning":
+        update_booking(booking_id, reminder_morning_sent=True)
+
+
+def get_booking(booking_id: str) -> dict | None:
+    for b in get_confirmed_bookings():
+        if str(b.get("id")) == str(booking_id):
+            return b
+    return None
