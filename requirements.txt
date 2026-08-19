@@ -1,0 +1,12 @@
+aiogram==3.13.1
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+pyyaml==6.0.2
+google-api-python-client==2.147.0
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+apscheduler==3.10.4
+loguru==0.7.2
