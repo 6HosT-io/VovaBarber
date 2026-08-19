@@ -87,25 +87,49 @@ async def cmd_start(message: Message, state: FSMContext):
 
     # Welcome text from /settings if set, otherwise default
     custom = store.get_welcome_text(lang)
+    privacy_ru = (
+        "\n\n🔒 Данные (имя, комментарии к записи, история визитов) нужны только "
+        "для записи к барберу и связи с вами. Третьим лицам не передаём."
+    )
+    privacy_lv = (
+        "\n\n🔒 Dati (vārds, pieraksta komentāri, vizīšu vēsture) nepieciešami tikai "
+        "pierakstam un saziņai. Trešajām personām netiek nodoti."
+    )
     defaults = {
         "ru": (
-            "Привет! 👋\n"
-            "Я бот барбершопа на Jasmuižas iela 9, Rīga.\n\n"
-            "Здесь можно быстро записаться, посмотреть цены и историю.\n"
-            "Выберите действие в меню или используйте /book, /prices, /history, /cancel."
+            "Запись к Лучшему Барберу, Парикмахеру и Другу — без звонков и ожидания!\n\n"
+            "🗓️ Выберите день (сегодня / завтра / послезавтра)\n"
+            "⌚️ Укажите удобное время\n"
+            "닦다 Выберите услугу\n"
+            "☑️ Получите подтверждение от барбера\n\n"
+            "💈 Адрес: Jasmuižas iela 9, Rīga\n"
+            "Языки: русский и латышский\n\n"
+            "Просто нажмите Start и выбирайте, что актуально.\n\n"
+            "Важно: бот отправляет напоминания за 24 часа до записи и в тот же день. "
+            "Если подтвердите в первый раз — утром того же дня оповещения не будет."
+            + privacy_ru
         ),
         "lv": (
-            "Sveiki! 👋\n"
-            "Esmu frizētavas bots Jasmuižas iela 9, Rīga.\n\n"
-            "Šeit var ātri pierakstīties, apskatīt cenas un vēsturi.\n"
-            "Izvēlieties darbību vai izmantojiet /book, /prices, /history, /cancel."
+            "Reģistrējieties pie labākā bārddziņa, friziera un drauga — bez zvaniem un gaidīšanas!\n\n"
+            "🗓️ Izvēlieties dienu (šodien / rīt / parīt)\n"
+            "⌚️ Norādiet jums ērtu laiku\n"
+            "💇 Izvēlieties pakalpojumu\n"
+            "☑️ Saņemiet apstiprinājumu no bārddziņa\n\n"
+            "💈 Adrese: Jasmuižas iela 9, Rīga\n"
+            "Valodas: krievu un latviešu\n\n"
+            "Vienkārši nospiediet Start un izvēlieties to, kas jums ir aktuāli.\n\n"
+            "Svarīgi: bots nosūta atgādinājumus 24 stundas pirms rezervācijas un tajā pašā dienā. "
+            "Ja apstiprināsiet pirmo reizi, tajā pašā rītā atgādinājums netiks nosūtīts."
+            + privacy_lv
         ),
     }
+
     # Use custom only if it was actually saved (not the short built-in fallback)
     short_fallback_ru = "Привет! Я бот барбершопа. Здесь можно быстро записаться."
     short_fallback_lv = "Sveiki! Esmu frizētavas bots. Šeit var ātri pierakstīties."
     if custom and custom not in (short_fallback_ru, short_fallback_lv):
-        caption = custom
+        # Always append short privacy note even to custom welcome
+        caption = custom + (privacy_ru if lang == "ru" else privacy_lv)
     else:
         caption = defaults[lang]
 
@@ -353,9 +377,11 @@ async def cmd_history(message: Message):
 async def cmd_contact(message: Message):
     lang = get_lang(message)
     text = (
-        "📞 Напишите ваш вопрос прямо сюда — сообщение уйдёт барберу в группу."
+        "📞 Напишите ваш вопрос прямо сюда — сообщение уйдёт барберу в группу.\n\n"
+        "🔒 Данные используются только для записи и связи, третьим лицам не передаём."
         if lang == "ru"
-        else "📞 Uzrakstiet jautājumu šeit — ziņa aizies frizierim uz grupu."
+        else "📞 Uzrakstiet jautājumu šeit — ziņa aizies frizierim uz grupu.\n\n"
+        "🔒 Dati tiek izmantoti tikai pierakstam un saziņai, trešajām personām netiek nodoti."
     )
     await message.answer(text)
 
