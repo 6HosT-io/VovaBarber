@@ -819,28 +819,35 @@ async def bookings_bulk_all_ask(callback: CallbackQuery):
 
 
 async def _bulk_cancel(bot: Bot, bookings: list) -> int:
+    import asyncio
     from src.services import settings_store as store
     from src.services import calendar as gcal
+    delay = getattr(store, "NOTIFY_DELAY_SEC", 0.35)
     n = 0
     for b in bookings:
         if b.get("status") != "confirmed":
             continue
-        store.cancel_booking(b["id"], by="barber")
+        result = store.cancel_booking(b["id"], by="barber")
+        if not result.get("ok"):
+            continue
+        b2 = result["booking"]
         try:
-            eid = b.get("calendar_event_id")
+            eid = b2.get("calendar_event_id")
             if eid:
                 gcal.delete_event(eid)
         except Exception:
             pass
         try:
             await bot.send_message(
-                int(b["user_id"]),
-                f"❌ Запись на <b>{b.get('date')}</b> отменена барбером.\n"
+                int(b2["user_id"]),
+                f"❌ Барбер отменил вашу запись на <b>{b2.get('date')}</b>.\n"
                 f"Можно выбрать другое время через /book.",
             )
         except Exception as e:
             logger.error(f"bulk notify: {e}")
         n += 1
+        if delay > 0:
+            await asyncio.sleep(delay)
     return n
 
 
@@ -885,10 +892,19 @@ async def cmd_cancel_id(message: Message, bot: Bot):
         return
     booking_id = parts[1].strip()
     from src.services import settings_store as store
-    b = store.cancel_booking(booking_id, by="barber")
-    if not b:
-        await message.answer("Запись не найдена или уже отменена.")
+    result = store.cancel_booking(booking_id, by="barber")
+    if not result.get("ok"):
+        who = result.get("cancelled_by")
+        if result.get("reason") == "already_cancelled":
+            await message.answer(
+                f"Уже отменено"
+                + (f" (клиентом)" if who == "client" else f" ({who})" if who else "")
+                + "."
+            )
+        else:
+            await message.answer("Запись не найдена.")
         return
+    b = result["booking"]
     try:
         from src.services import calendar as gcal
         eid = b.get("calendar_event_id")
@@ -899,7 +915,7 @@ async def cmd_cancel_id(message: Message, bot: Bot):
     try:
         await bot.send_message(
             int(b["user_id"]),
-            f"❌ Запись на <b>{b.get('date')}</b> отменена барбером.\n"
+            f"❌ Барбер отменил вашу запись на <b>{b.get('date')}</b>.\n"
             f"Можно выбрать другое время через /book.",
         )
     except Exception as e:
