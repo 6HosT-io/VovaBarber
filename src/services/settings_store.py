@@ -4,11 +4,26 @@ Reads defaults from config/*.yaml and allows overrides saved to config/runtime_s
 """
 from pathlib import Path
 from typing import Any
+import os
+import time
 import yaml
 from loguru import logger
+import threading
+
+try:
+    import fcntl
+except ImportError:  # Windows local only
+    fcntl = None
+
+_BOOKING_LOCK = threading.RLock()
+_RUNTIME_LOCK = threading.RLock()
 
 BASE = Path("config")
 RUNTIME_FILE = BASE / "runtime_settings.yaml"
+RUNTIME_LOCK_FILE = BASE / "runtime_settings.lock"
+
+# Delay between outbound Telegram notifies (bulk cancel, etc.) seconds
+NOTIFY_DELAY_SEC = float(os.getenv("NOTIFY_DELAY_SEC", "0.35"))
 
 
 def _load_yaml(path: Path) -> dict:
@@ -24,12 +39,49 @@ def _save_yaml(path: Path, data: dict):
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
+def _with_file_lock(exclusive: bool = True):
+    """Context manager: process-level lock for runtime_settings.yaml."""
+    class _LockCtx:
+        def __enter__(self):
+            RUNTIME_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(RUNTIME_LOCK_FILE, "a+", encoding="utf-8")
+            if fcntl is not None:
+                flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                # retry a few times if locked
+                for _ in range(50):
+                    try:
+                        fcntl.flock(self._fh.fileno(), flag | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.05)
+                else:
+                    fcntl.flock(self._fh.fileno(), flag)
+            return self
+
+        def __exit__(self, *args):
+            if fcntl is not None:
+                try:
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+
+    return _LockCtx()
+
+
 def get_runtime() -> dict:
-    return _load_yaml(RUNTIME_FILE)
+    with _RUNTIME_LOCK:
+        with _with_file_lock(exclusive=False):
+            return _load_yaml(RUNTIME_FILE)
 
 
 def save_runtime(data: dict):
-    _save_yaml(RUNTIME_FILE, data)
+    with _RUNTIME_LOCK:
+        with _with_file_lock(exclusive=True):
+            _save_yaml(RUNTIME_FILE, data)
     logger.info("Runtime settings saved")
 
 
@@ -405,13 +457,78 @@ def add_confirmed_booking(
     return bid
 
 
-def cancel_booking(booking_id: str, by: str = "barber") -> dict | None:
-    """Cancel booking; remove from history; stop reminders. by: barber|client"""
-    b = update_booking(booking_id, status=f"cancelled_by_{by}")
-    if not b:
-        return None
-    cancel_service_history(int(b["user_id"]), booking_id=booking_id, date_str=b.get("date", ""))
-    return b
+def cancel_booking(booking_id: str, by: str = "barber") -> dict:
+    """
+    Idempotent cancel under lock.
+    Returns dict:
+      ok: bool
+      reason: cancelled | already_cancelled | not_found
+      booking: dict | None
+      cancelled_by: str | None  (who cancelled first, if already done)
+    """
+    with _BOOKING_LOCK:
+        existing = get_booking(booking_id)
+        if not existing:
+            return {"ok": False, "reason": "not_found", "booking": None, "cancelled_by": None}
+        status = existing.get("status", "")
+        if status != "confirmed":
+            who = None
+            if status.startswith("cancelled_by_"):
+                who = status.replace("cancelled_by_", "", 1)
+            return {
+                "ok": False,
+                "reason": "already_cancelled",
+                "booking": existing,
+                "cancelled_by": who or status,
+            }
+        b = update_booking(booking_id, status=f"cancelled_by_{by}")
+        cancel_service_history(int(b["user_id"]), booking_id=booking_id, date_str=b.get("date", ""))
+        return {"ok": True, "reason": "cancelled", "booking": b, "cancelled_by": by}
+
+
+def reschedule_booking(
+    booking_id: str,
+    new_date: str,
+    new_comment: str,
+) -> dict:
+    """
+    Update date/comment on a confirmed booking; reset reminder flags.
+    Returns same shape as cancel_booking for consistency.
+    """
+    with _BOOKING_LOCK:
+        existing = get_booking(booking_id)
+        if not existing:
+            return {"ok": False, "reason": "not_found", "booking": None}
+        if existing.get("status") != "confirmed":
+            return {
+                "ok": False,
+                "reason": "not_active",
+                "booking": existing,
+            }
+        b = update_booking(
+            booking_id,
+            date=new_date,
+            comment=new_comment,
+            reminder_24h_sent=False,
+            reminder_morning_sent=False,
+            client_confirmed=False,
+            client_thinking=False,
+            # keep calendar_event_id; caller may recreate event
+        )
+        # Update history entry text for this booking_id
+        runtime = get_runtime()
+        history = runtime.get("service_history", {}) or {}
+        key = str(b.get("user_id"))
+        entries = history.get(key, [])
+        if isinstance(entries, list):
+            for e in entries:
+                if e.get("booking_id") == booking_id and e.get("status", "active") != "cancelled":
+                    e["date"] = new_date
+                    e["service"] = (new_comment or "").strip() or e.get("service", "—")
+            history[key] = entries
+            runtime["service_history"] = history
+            save_runtime(runtime)
+        return {"ok": True, "reason": "rescheduled", "booking": b}
 
 
 def get_active_bookings_for_user(user_id: int) -> list:
@@ -453,3 +570,27 @@ def get_booking(booking_id: str) -> dict | None:
         if str(b.get("id")) == str(booking_id):
             return b
     return None
+
+
+def get_all_active_bookings() -> list:
+    """All confirmed (not cancelled) bookings, newest last."""
+    return [b for b in get_confirmed_bookings() if b.get("status") == "confirmed"]
+
+
+def find_active_bookings(query: str) -> list:
+    """Search active bookings by contact name, telegram name, comment, date, or id."""
+    q = (query or "").strip().lower()
+    if not q:
+        return get_all_active_bookings()
+    results = []
+    for b in get_all_active_bookings():
+        uid = int(b.get("user_id", 0))
+        contact = (get_client_contact_name(uid) or "").lower()
+        name = (b.get("client_name") or "").lower()
+        comment = (b.get("comment") or "").lower()
+        date = (b.get("date") or "").lower()
+        bid = str(b.get("id", "")).lower()
+        hay = f"{contact} {name} {comment} {date} {bid} {uid}"
+        if q in hay:
+            results.append(b)
+    return results
