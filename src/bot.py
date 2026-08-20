@@ -33,7 +33,8 @@ PUBLIC_COMMANDS = [
     BotCommand(command="prices", description="Цены / Cenas"),
     BotCommand(command="history", description="История / Vēsture"),
     BotCommand(command="contact", description="Связаться / Sazināties"),
-    BotCommand(command="cancel", description="Отменить / Atcelt"),
+    BotCommand(command="cancel", description="Отменить шаг / Atcelt"),
+    BotCommand(command="cancel_booking", description="Отменить запись / Atcelt pierakstu"),
     BotCommand(command="help", description="Помощь / Palīdzība"),
 ]
 
@@ -46,6 +47,8 @@ ADMIN_EXTRA = [
     BotCommand(command="vacation", description="Блок диапазона"),
     BotCommand(command="unvacation", description="Снять блок диапазона"),
     BotCommand(command="unblock_all", description="Снять все блоки"),
+    BotCommand(command="bookings", description="Активные записи"),
+    BotCommand(command="cancel_id", description="Отмена по ID"),
 ]
 
 
@@ -87,7 +90,10 @@ def register_handlers():
 
 async def on_startup():
     await set_bot_commands(bot)
-    logger.info("Bot started successfully")
+    # Background reminders (24h + morning)
+    from src.services.reminders import reminder_loop
+    asyncio.create_task(reminder_loop(bot))
+    logger.info("Bot started successfully (reminders loop on)")
 
 
 async def main():
