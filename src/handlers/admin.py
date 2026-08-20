@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -131,7 +131,10 @@ async def cmd_admin(message: Message):
         "/unblock ДД/ММ/ГГГГ — один день\n"
         "/vacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ — блок диапазона\n"
         "/unvacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ — снять блок с диапазона\n"
-        "/unblock_all — снять все блокировки\n\n"
+        "/unblock_all — снять все блокировки\n"
+        "/bookings — активные записи\n"
+        "/bookings имя — поиск по клиенту\n"
+        "/cancel_id ID — отмена по ID\n\n"
         f"Группа: <code>{get_admin_group() or '—'}</code>\n"
         f"Твой ID: <code>{message.from_user.id}</code>"
     )
@@ -622,4 +625,286 @@ async def cmd_unblock_all(message: Message):
     await message.answer(
         f"🔓 Сняты все блокировки (<b>{count}</b> дн.).\n\n"
         "Если нужно снова закрыть дни — /vacation или /block."
+    )
+
+
+
+PAGE_SIZE = 5
+
+
+def _bookings_nav_kb(page: int, total_pages: int, query: str = "") -> InlineKeyboardMarkup:
+    # query truncated for callback limit
+    q = (query or "")[:30]
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️",
+            callback_data=f"bk:p:{page - 1}:{q}",
+        ))
+    nav.append(InlineKeyboardButton(
+        text=f"{page + 1}/{total_pages}",
+        callback_data="bk:noop",
+    ))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(
+            text="▶️",
+            callback_data=f"bk:p:{page + 1}:{q}",
+        ))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(
+            text="❌ Отменить все на странице",
+            callback_data=f"bk:bulkpage:{page}:{q}",
+        )
+    ])
+    if q:
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Отменить все найденные",
+                callback_data=f"bk:bulkall:{q}",
+            )
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Отменить ВСЕ активные",
+                callback_data="bk:bulkall:",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_bookings_page(target, page: int = 0, query: str = ""):
+    """target: Message or CallbackQuery.message"""
+    from src.services import settings_store as store
+
+    items = store.find_active_bookings(query) if query else store.get_all_active_bookings()
+    items = list(reversed(items))
+    total = len(items)
+    if total == 0:
+        text = (
+            "Активных записей нет." if not query
+            else f"Ничего не найдено по «{query}».\n"
+            "Поиск: имя, контакты, дата, комментарий."
+        )
+        if hasattr(target, "edit_text"):
+            try:
+                await target.edit_text(text)
+            except Exception:
+                await target.answer(text)
+        else:
+            await target.answer(text)
+        return
+
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+
+    header = (
+        f"📋 Активные записи: <b>{total}</b>"
+        + (f" | поиск: <code>{query}</code>" if query else "")
+        + f"\nСтраница <b>{page + 1}/{total_pages}</b>"
+    )
+    nav = _bookings_nav_kb(page, total_pages, query)
+
+    # Prefer editing the header message when paginating
+    if hasattr(target, "edit_text") and getattr(target, "text", None) and target.text.startswith("📋"):
+        await target.edit_text(header, reply_markup=nav)
+    else:
+        await target.answer(header, reply_markup=nav)
+
+    for b in chunk:
+        uid = int(b.get("user_id", 0))
+        contact = store.get_client_contact_name(uid)
+        name = b.get("client_name") or "Клиент"
+        line = f"👤 {name}"
+        if contact:
+            line += f"\n📱 В контактах: <b>{contact}</b>"
+        line += (
+            f"\n📅 {b.get('date', '—')}"
+            f"\n💬 {b.get('comment', '—')}"
+            f"\nID: <code>{b.get('id')}</code>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Отменить эту запись",
+                callback_data=f"adm:cancel:{b.get('id')}",
+            )],
+            [InlineKeyboardButton(
+                text="💬 Написать клиенту",
+                url=f"tg://user?id={uid}",
+            )],
+        ])
+        # always send cards as new messages (hard to edit many)
+        chat = target.chat if hasattr(target, "chat") else target
+        bot = target.bot if hasattr(target, "bot") else None
+        if bot:
+            await bot.send_message(chat.id, line, reply_markup=kb)
+        else:
+            await target.answer(line, reply_markup=kb)
+
+
+@router.message(Command("bookings", "active"))
+async def cmd_bookings(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    await _send_bookings_page(message, page=0, query=query)
+
+
+@router.callback_query(F.data.startswith("bk:p:"))
+async def bookings_page(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":", 3)
+    # bk:p:PAGE:query
+    page = int(parts[2]) if len(parts) > 2 else 0
+    query = parts[3] if len(parts) > 3 else ""
+    await _send_bookings_page(callback.message, page=page, query=query)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bk:noop")
+async def bookings_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bk:bulkpage:"))
+async def bookings_bulk_page_ask(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    parts = callback.data.split(":", 3)
+    page = parts[2] if len(parts) > 2 else "0"
+    query = parts[3] if len(parts) > 3 else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Да, отменить страницу", callback_data=f"bk:dobulkpage:{page}:{query}"),
+            InlineKeyboardButton(text="Нет", callback_data="bk:noop"),
+        ]
+    ])
+    await callback.message.answer(
+        "Точно отменить <b>все записи на этой странице</b>?",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bk:bulkall"))
+async def bookings_bulk_all_ask(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    # bk:bulkall: or bk:bulkall:query
+    query = callback.data.split(":", 2)[2] if callback.data.count(":") >= 2 else ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="Да, отменить все",
+                callback_data=f"bk:dobulkall:{query}",
+            ),
+            InlineKeyboardButton(text="Нет", callback_data="bk:noop"),
+        ]
+    ])
+    scope = f"по поиску «{query}»" if query else "все активные"
+    await callback.message.answer(
+        f"Точно отменить <b>{scope}</b> записи?",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+async def _bulk_cancel(bot: Bot, bookings: list) -> int:
+    from src.services import settings_store as store
+    from src.services import calendar as gcal
+    n = 0
+    for b in bookings:
+        if b.get("status") != "confirmed":
+            continue
+        store.cancel_booking(b["id"], by="barber")
+        try:
+            eid = b.get("calendar_event_id")
+            if eid:
+                gcal.delete_event(eid)
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                int(b["user_id"]),
+                f"❌ Запись на <b>{b.get('date')}</b> отменена барбером.\n"
+                f"Можно выбрать другое время через /book.",
+            )
+        except Exception as e:
+            logger.error(f"bulk notify: {e}")
+        n += 1
+    return n
+
+
+@router.callback_query(F.data.startswith("bk:dobulkpage:"))
+async def bookings_do_bulk_page(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    from src.services import settings_store as store
+    parts = callback.data.split(":", 3)
+    page = int(parts[2]) if len(parts) > 2 else 0
+    query = parts[3] if len(parts) > 3 else ""
+    items = store.find_active_bookings(query) if query else store.get_all_active_bookings()
+    items = list(reversed(items))
+    chunk = items[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    n = await _bulk_cancel(bot, chunk)
+    await callback.message.answer(f"✅ Отменено на странице: <b>{n}</b>")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bk:dobulkall:"))
+async def bookings_do_bulk_all(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    from src.services import settings_store as store
+    query = callback.data.split(":", 2)[2] if callback.data.count(":") >= 2 else ""
+    items = store.find_active_bookings(query) if query else store.get_all_active_bookings()
+    n = await _bulk_cancel(bot, items)
+    await callback.message.answer(f"✅ Отменено записей: <b>{n}</b>")
+    await callback.answer()
+
+
+@router.message(Command("cancel_id"))
+async def cmd_cancel_id(message: Message, bot: Bot):
+    """Cancel by booking id: /cancel_id 1234567890"""
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Синтаксис: <code>/cancel_id ID</code>\nID видно в /bookings")
+        return
+    booking_id = parts[1].strip()
+    from src.services import settings_store as store
+    b = store.cancel_booking(booking_id, by="barber")
+    if not b:
+        await message.answer("Запись не найдена или уже отменена.")
+        return
+    try:
+        from src.services import calendar as gcal
+        eid = b.get("calendar_event_id")
+        if eid:
+            gcal.delete_event(eid)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            int(b["user_id"]),
+            f"❌ Запись на <b>{b.get('date')}</b> отменена барбером.\n"
+            f"Можно выбрать другое время через /book.",
+        )
+    except Exception as e:
+        logger.error(f"cancel_id notify: {e}")
+    await message.answer(
+        f"✅ Отменено: {b.get('date')} — {b.get('client_name') or b.get('user_id')}\n"
+        f"💬 {b.get('comment')}"
     )

@@ -324,8 +324,9 @@ async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.message(Command("cancel_booking"))
+@router.message(F.text.in_({"❌ Отменить запись", "❌ Atcelt pierakstu"}))
 async def cmd_cancel_booking(message: Message, bot: Bot):
-    """Client cancels an active confirmed appointment."""
+    """Client cancels an active confirmed appointment (pick if several)."""
     from src.services import settings_store as store
     lang = get_lang(message)
     active = store.get_active_bookings_for_user(message.from_user.id)
@@ -335,8 +336,30 @@ async def cmd_cancel_booking(message: Message, bot: Bot):
             else "Nav aktīvu pierakstu."
         )
         return
-    # Cancel the nearest / latest active
-    b = active[-1]
+
+    if len(active) == 1:
+        await _do_client_cancel(message, bot, active[-1], lang)
+        return
+
+    await message.answer(
+        "Несколько записей. Выберите, какую отменить:" if lang == "ru"
+        else "Vairāki pieraksti. Izvēlieties, kuru atcelt:"
+    )
+    for b in active:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"❌ {b.get('date')} — отменить",
+                callback_data=f"cli:cancel:{b.get('id')}",
+            )]
+        ])
+        await message.answer(
+            f"📅 {b.get('date')}\n💬 {b.get('comment')}",
+            reply_markup=kb,
+        )
+
+
+async def _do_client_cancel(message_or_cb, bot: Bot, b: dict, lang: str):
+    from src.services import settings_store as store
     store.cancel_booking(b["id"], by="client")
     try:
         from src.services import calendar as gcal
@@ -345,15 +368,20 @@ async def cmd_cancel_booking(message: Message, bot: Bot):
             gcal.delete_event(eid)
     except Exception:
         pass
-    await message.answer(
-        f"❌ Запись на <b>{b.get('date')}</b> отменена.\n"
-        f"Можно записаться снова через /book."
+    text = (
+        f"❌ Запись на <b>{b.get('date')}</b> отменена.\nМожно записаться снова через /book."
         if lang == "ru"
         else f"❌ Pieraksts uz <b>{b.get('date')}</b> atcelts."
     )
+    if hasattr(message_or_cb, "answer") and not hasattr(message_or_cb, "message"):
+        await message_or_cb.answer(text)
+        user = message_or_cb.from_user
+    else:
+        await message_or_cb.message.answer(text)
+        user = message_or_cb.from_user
     if ADMIN_GROUP_ID:
         try:
-            line = store.format_client_line(message.from_user.id, message.from_user.full_name)
+            line = store.format_client_line(user.id, user.full_name)
             await bot.send_message(
                 ADMIN_GROUP_ID,
                 f"❌ Клиент отменил подтверждённую запись\n"
@@ -363,6 +391,23 @@ async def cmd_cancel_booking(message: Message, bot: Bot):
             )
         except Exception as e:
             logger.error(f"cancel_booking group notify: {e}")
+
+
+@router.callback_query(F.data.startswith("cli:cancel:"))
+async def client_cancel_pick(callback: CallbackQuery, bot: Bot):
+    booking_id = callback.data.split(":")[2]
+    from src.services import settings_store as store
+    b = store.get_booking(booking_id)
+    if not b or b.get("status") != "confirmed":
+        await callback.answer("Уже отменено", show_alert=True)
+        return
+    if int(b.get("user_id", 0)) != callback.from_user.id:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    lang = "ru"
+    await _do_client_cancel(callback, bot, b, lang)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отменено")
 
 
 # ---------- Prices / History / Contact / Help ----------
@@ -695,6 +740,7 @@ async def forward_free_text(message: Message, bot: Bot, state: FSMContext):
         "💰 Цены", "💰 Cenas",
         "📞 Связаться", "📞 Sazināties",
         "🌐 Language / Valoda",
+        "❌ Отменить запись", "❌ Atcelt pierakstu",
         "отменить", "отмена", "cancel", "atcelt",
     }
     if message.text and message.text.lower() in menu_buttons:
