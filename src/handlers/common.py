@@ -86,6 +86,11 @@ def resolve_date(day_key: str) -> str:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     lang = get_lang(message)
+    try:
+        from src.services import settings_store as store
+        store.track_event("start", message.from_user.id)
+    except Exception:
+        pass
     from src.services import settings_store as store
 
     # Welcome text from /settings if set, otherwise default
@@ -143,6 +148,22 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(caption, reply_markup=main_menu_kb(lang))
 
 
+
+async def _deny_if_closed_or_full(message_or_cb, date_str: str, lang: str, *, as_callback: bool) -> bool:
+    """Return True if day is closed/full and client was notified (stop flow)."""
+    from src.services import settings_store as store
+    closed = store.is_blocked(date_str)
+    full = (not closed) and store.is_day_full(date_str)
+    if not closed and not full:
+        return False
+    msg = store.client_unavailable_message(date_str, lang)
+    if as_callback:
+        await message_or_cb.message.edit_text(msg)
+        await message_or_cb.answer()
+    else:
+        await message_or_cb.answer(msg)
+    return True
+
 # ---------- Book ----------
 
 @router.message(Command("book", "start_booking"))
@@ -154,15 +175,53 @@ async def cmd_book(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=day_selection_kb(lang))
 
 
+async def _apply_reschedule_day(callback: CallbackQuery, state: FSMContext, day_key: str):
+    """Shared logic when client picks a new day while rescheduling."""
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+    from src.services import settings_store as store
+
+    if day_key == "other":
+        await state.set_state(BookingStates.reschedule_custom_date)
+        await callback.message.edit_text(
+            "Введите новую дату <b>ДД/ММ/ГГГГ</b>" if lang == "ru"
+            else "Ievadiet jauno datumu <b>DD/MM/GGGG</b>"
+        )
+        await callback.answer()
+        return
+
+    date_str = resolve_date(day_key)
+    if store.is_blocked(date_str) or store.is_day_full(date_str):
+        msg = store.client_unavailable_message(date_str, lang)
+        await callback.message.edit_text(msg)
+        await callback.answer()
+        return
+    await state.update_data(reschedule_date=date_str, reschedule_day_key=day_key)
+    await state.set_state(BookingStates.reschedule_comment)
+    await callback.message.edit_text(
+        f"Новая дата: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
+        f"Напишите время или комментарий:"
+        if lang == "ru"
+        else f"Jaunais datums: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
+        f"Uzrakstiet laiku vai komentāru:"
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("day:"))
 async def process_day(callback: CallbackQuery, state: FSMContext):
     current = await state.get_state()
+    # Reschedule flow uses the same day buttons — handle here so callback is answered
+    if current == BookingStates.reschedule_date.state:
+        day_key = callback.data.split(":")[1]
+        await _apply_reschedule_day(callback, state, day_key)
+        return
     if current in (
-        BookingStates.reschedule_date.state,
         BookingStates.reschedule_custom_date.state,
         BookingStates.reschedule_comment.state,
     ):
-        return  # handled by reschedule_day
+        await callback.answer()
+        return
     day_key = callback.data.split(":")[1]
     lang_code = (callback.from_user.language_code or "ru").lower()
     lang = "lv" if lang_code.startswith("lv") else "ru"
@@ -182,15 +241,7 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
         return
 
     date_str = resolve_date(day_key)
-    from src.services import settings_store as store
-    if store.is_blocked(date_str):
-        msg = (
-            f"Этот день (<b>{date_str}</b>) недоступен для записи. Выберите другой."
-            if lang == "ru"
-            else f"Šī diena (<b>{date_str}</b>) nav pieejama. Izvēlieties citu."
-        )
-        await callback.message.edit_text(msg)
-        await callback.answer()
+    if await _deny_if_closed_or_full(callback, date_str, lang, as_callback=True):
         return
 
     await state.update_data(day_key=day_key, date=date_str)
@@ -226,14 +277,7 @@ async def process_custom_date(message: Message, state: FSMContext):
         return
 
     date_str = to_display(parsed)
-    from src.services import settings_store as store
-    if store.is_blocked(date_str):
-        msg = (
-            f"Этот день (<b>{date_str}</b>) недоступен для записи. Выберите другой."
-            if lang == "ru"
-            else f"Šī diena (<b>{date_str}</b>) nav pieejama. Izvēlieties citu."
-        )
-        await message.answer(msg)
+    if await _deny_if_closed_or_full(message, date_str, lang, as_callback=False):
         return
 
     await state.update_data(day_key="other", date=date_str)
@@ -279,7 +323,7 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     if ADMIN_GROUP_ID:
         user = message.from_user
         from src.services import settings_store as store
-        client_line = store.format_client_line(user.id, user.full_name)
+        client_line = store.format_client_line(user.id, user.full_name, ref_date=date_str)
         group_text = (
             f"🆕 <b>Новая заявка</b>\n\n"
             f"{client_line}\n"
@@ -304,7 +348,9 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
                 date_str,
                 comment,
                 client_name=user.full_name or "",
+                kind="book",
             )
+            store.track_event("book_request", user.id)
             await bot.send_message(ADMIN_GROUP_ID, group_text, reply_markup=kb)
             logger.info(f"Booking request from {user.id} sent to group")
         except Exception as e:
@@ -383,6 +429,11 @@ async def _do_client_cancel(message_or_cb, bot: Bot, b: dict, lang: str):
             await message_or_cb.message.answer(text)
         return
     result = store.cancel_booking(b["id"], by="client")
+    if result.get("ok"):
+        try:
+            store.track_event("cancel_client", int(b.get("user_id") or 0))
+        except Exception:
+            pass
     if not result.get("ok"):
         text = (
             "Эта запись уже отменена." if lang == "ru"
@@ -512,33 +563,7 @@ async def client_resched_pick(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(BookingStates.reschedule_date, F.data.startswith("day:"))
 async def reschedule_day(callback: CallbackQuery, state: FSMContext):
     day_key = callback.data.split(":")[1]
-    lang_code = (callback.from_user.language_code or "ru").lower()
-    lang = "lv" if lang_code.startswith("lv") else "ru"
-    from src.services import settings_store as store
-
-    if day_key == "other":
-        await state.set_state(BookingStates.reschedule_custom_date)
-        await callback.message.edit_text(
-            "Введите новую дату <b>ДД/ММ/ГГГГ</b>" if lang == "ru"
-            else "Ievadiet jauno datumu <b>DD/MM/GGGG</b>"
-        )
-        await callback.answer()
-        return
-
-    date_str = resolve_date(day_key)
-    if store.is_blocked(date_str):
-        await callback.answer("День недоступен", show_alert=True)
-        return
-    await state.update_data(reschedule_date=date_str, reschedule_day_key=day_key)
-    await state.set_state(BookingStates.reschedule_comment)
-    await callback.message.edit_text(
-        f"Новая дата: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
-        f"Напишите время или комментарий:"
-        if lang == "ru"
-        else f"Jaunais datums: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
-        f"Uzrakstiet laiku vai komentāru:"
-    )
-    await callback.answer()
+    await _apply_reschedule_day(callback, state, day_key)
 
 
 @router.message(BookingStates.reschedule_custom_date)
@@ -550,8 +575,8 @@ async def reschedule_custom_date(message: Message, state: FSMContext):
         await message.answer("Формат: <b>ДД/ММ/ГГГГ</b>")
         return
     date_str = to_display(parsed)
-    if store.is_blocked(date_str):
-        await message.answer("Этот день недоступен.")
+    if store.is_blocked(date_str) or store.is_day_full(date_str):
+        await message.answer(store.client_unavailable_message(date_str, lang))
         return
     await state.update_data(reschedule_date=date_str, reschedule_day_key="other")
     await state.set_state(BookingStates.reschedule_comment)
@@ -562,6 +587,7 @@ async def reschedule_custom_date(message: Message, state: FSMContext):
 
 @router.message(BookingStates.reschedule_comment)
 async def reschedule_comment(message: Message, state: FSMContext, bot: Bot):
+    """Send reschedule request to admin group — same as /book (needs accept/reject)."""
     from src.services import settings_store as store
     lang = get_lang(message)
     data = await state.get_data()
@@ -572,38 +598,63 @@ async def reschedule_comment(message: Message, state: FSMContext, bot: Bot):
     if not booking_id or not new_date:
         await message.answer("Сессия сброшена. Начните снова: /reschedule")
         return
-    result = store.reschedule_booking(booking_id, new_date, comment)
-    if not result.get("ok"):
+    existing = store.get_booking(booking_id)
+    if not existing or existing.get("status") != "confirmed":
         await message.answer(
-            "Не удалось перенести: запись уже отменена или не найдена."
-            if lang == "ru" else "Neizdevās pārcelt."
+            "Запись уже недоступна для переноса." if lang == "ru"
+            else "Pieraksts vairs nav pieejams."
         )
         return
-    b = result["booking"]
+    old_date = existing.get("date", "—")
+    user = message.from_user
+    store.save_pending_booking(
+        user.id,
+        new_date,
+        comment,
+        client_name=user.full_name or "",
+        kind="reschedule",
+        reschedule_id=booking_id,
+        old_date=old_date,
+    )
+    store.track_event("reschedule_request", user.id)
     await message.answer(
-        f"✅ Запись перенесена на <b>{new_date}</b>\n💬 {comment}\n\n"
-        f"Барбер получит уведомление."
+        f"✅ Запрос на перенос отправлен!\n\n"
+        f"Было: <b>{old_date}</b>\n"
+        f"Новая дата: <b>{new_date}</b>\n"
+        f"💬 {comment}\n\n"
+        f"Ждём подтверждения барбера. Старая запись пока действует."
         if lang == "ru"
-        else f"✅ Pieraksts pārcelts uz <b>{new_date}</b>\n💬 {comment}"
+        else f"✅ Pārcelšanas pieprasījums nosūtīts!\nVecais: <b>{old_date}</b> → <b>{new_date}</b>",
+        reply_markup=main_menu_kb(lang),
     )
     if ADMIN_GROUP_ID:
         try:
-            line = store.format_client_line(message.from_user.id, message.from_user.full_name)
-            await bot.send_message(
-                ADMIN_GROUP_ID,
-                f"📅 <b>Клиент перенёс запись</b>\n"
+            line = store.format_client_line(user.id, user.full_name, ref_date=new_date)
+            group_text = (
+                f"📅 <b>Запрос на перенос</b>\n\n"
                 f"{line}\n"
+                f"Было: <b>{old_date}</b>\n"
                 f"Новая дата: <b>{new_date}</b>\n"
-                f"💬 {comment}\n"
-                f"ID: <code>{booking_id}</code>",
+                f"💬 Комментарий: {comment}\n"
+                f"ID: <code>{booking_id}</code>"
             )
-            await _clear_group_cancel_button(bot, b)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Подтвердить перенос", callback_data=f"adm:ok:{user.id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{user.id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="💬 Написать клиенту", url=f"tg://user?id={user.id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="📝 Имя в контактах", callback_data=f"adm:setname:{user.id}"),
+                ],
+            ])
+            await bot.send_message(ADMIN_GROUP_ID, group_text, reply_markup=kb)
         except Exception as e:
-            logger.error(f"reschedule group notify: {e}")
+            logger.error(f"reschedule group: {e}")
 
 
-
-# ---------- Prices / History / Contact / Help ----------
 
 @router.message(Command("prices", "price"))
 @router.message(F.text.in_({"💰 Цены", "💰 Cenas"}))
@@ -615,27 +666,78 @@ async def cmd_prices(message: Message):
     await message.answer(header + body)
 
 
-@router.message(Command("history"))
-@router.message(F.text.in_({"📋 История записей", "📋 Pierakstu vēsture"}))
-async def cmd_history(message: Message):
+HIST_PAGE_SIZE = 5
+
+
+def _history_text(user_id: int, page: int, lang: str) -> tuple[str, InlineKeyboardMarkup | None]:
     from src.services import settings_store as store
-    lang = get_lang(message)
-    items = store.get_last_services(message.from_user.id, limit=8)
-    if not items:
-        text = (
+    data = store.get_history_page(user_id, page=page, page_size=HIST_PAGE_SIZE)
+    if data["total"] == 0:
+        body = (
             "📋 Пока история пуста.\nКогда появятся подтверждённые записи, они будут здесь."
             if lang == "ru"
             else "📋 Vēsture pagaidām tukša."
         )
-        await message.answer(text)
-        return
+        return body, None
     lines = []
-    for e in items:
+    for e in data["items"]:
         svc = e.get("service", "—")
         dt = e.get("date", "")
         lines.append(f"• {dt + ' — ' if dt else ''}{svc}")
-    header = "📋 Ваша история:\n\n" if lang == "ru" else "📋 Jūsu vēsture:\n\n"
-    await message.answer(header + "\n".join(lines))
+    header = (
+        f"📋 Ваша история ({data['total']})\n"
+        f"Стр. {data['page'] + 1}/{data['total_pages']}\n\n"
+        if lang == "ru"
+        else f"📋 Vēsture ({data['total']})\n"
+        f"Lpp. {data['page'] + 1}/{data['total_pages']}\n\n"
+    )
+    kb = None
+    if data["total_pages"] > 1:
+        nav = []
+        if data["page"] > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️",
+                callback_data=f"hist:p:{data['page'] - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            text=f"{data['page'] + 1}/{data['total_pages']}",
+            callback_data="hist:noop",
+        ))
+        if data["page"] < data["total_pages"] - 1:
+            nav.append(InlineKeyboardButton(
+                text="▶️",
+                callback_data=f"hist:p:{data['page'] + 1}",
+            ))
+        kb = InlineKeyboardMarkup(inline_keyboard=[nav])
+    return header + "\n".join(lines), kb
+
+
+@router.message(Command("history"))
+@router.message(F.text.in_({"📋 История записей", "📋 Pierakstu vēsture"}))
+async def cmd_history(message: Message):
+    lang = get_lang(message)
+    body, kb = _history_text(message.from_user.id, page=0, lang=lang)
+    await message.answer(body, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("hist:p:"))
+async def history_page(callback: CallbackQuery):
+    try:
+        page = int(callback.data.split(":")[2])
+    except Exception:
+        page = 0
+    lang = "ru"
+    body, kb = _history_text(callback.from_user.id, page=page, lang=lang)
+    try:
+        await callback.message.edit_text(body, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(body, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "hist:noop")
+async def history_noop(callback: CallbackQuery):
+    await callback.answer()
 
 
 @router.message(Command("contact"))
@@ -710,7 +812,47 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
     pending = store.pop_pending_booking(client_id)
     cal_note = ""
     booking_id = ""
-    if pending:
+    is_reschedule = bool(pending and pending.get("kind") == "reschedule")
+
+    if pending and is_reschedule:
+        rid = pending.get("reschedule_id") or ""
+        result = store.reschedule_booking(
+            rid,
+            pending.get("date") or "",
+            pending.get("comment") or "",
+        )
+        if not result.get("ok"):
+            await callback.answer("Не удалось перенести (уже отменено?)", show_alert=True)
+            try:
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n⚠️ Перенос не применён"
+                )
+            except Exception:
+                pass
+            return
+        booking_id = rid
+        store.track_event("reschedule_confirmed", client_id)
+        name = pending.get("client_name") or "Клиент"
+        contact = store.get_client_contact_name(client_id)
+        summary = f"Barbershop: {contact or name} (перенос)"
+        desc = (
+            f"Telegram: {name}\n"
+            f"Комментарий: {pending.get('comment', '')}\n"
+            f"Дата: {pending.get('date', '')} (было {pending.get('old_date', '')})"
+        )
+        event_id = gcal.create_event(
+            summary=summary,
+            date_str=pending.get("date", ""),
+            comment=pending.get("comment", ""),
+            duration_min=45,
+            description=desc,
+        )
+        if event_id:
+            cal_note = "\n📅 Calendar обновлён"
+            store.update_booking(booking_id, calendar_event_id=event_id)
+        elif gcal.is_configured():
+            cal_note = "\n⚠️ Calendar: не удалось создать событие"
+    elif pending:
         booking_id = store.add_confirmed_booking(
             client_id,
             pending.get("date") or "",
@@ -723,6 +865,7 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             pending.get("date") or "",
             booking_id=booking_id,
         )
+        store.track_event("booking_confirmed", client_id)
         name = pending.get("client_name") or "Клиент"
         contact = store.get_client_contact_name(client_id)
         summary = f"Barbershop: {contact or name}"
@@ -746,13 +889,23 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
 
     try:
         location = store.get_location()
-        await bot.send_message(
-            client_id,
-            f"✅ Ваша заявка подтверждена! Ждём вас.\n"
-            f"📍 {location}\n"
-            f"Если что-то случится, вот телефон: +371 29985759\n\n"
-            f"Отменить запись: /cancel_booking",
-        )
+        if is_reschedule:
+            client_msg = (
+                f"✅ Перенос подтверждён!\n"
+                f"Новая дата: <b>{pending.get('date')}</b>\n"
+                f"💬 {pending.get('comment')}\n\n"
+                f"📍 {location}\n"
+                f"Если что-то случится: +371 29985759\n\n"
+                f"Отменить: /cancel_booking"
+            )
+        else:
+            client_msg = (
+                f"✅ Ваша заявка подтверждена! Ждём вас.\n"
+                f"📍 {location}\n"
+                f"Если что-то случится, вот телефон: +371 29985759\n\n"
+                f"Отменить запись: /cancel_booking"
+            )
+        await bot.send_message(client_id, client_msg)
         kb = None
         if booking_id:
             kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -762,7 +915,7 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
                 )],
             ])
         await callback.message.edit_text(
-            callback.message.text + f"\n\n✅ <b>Подтверждено</b>{cal_note}",
+            callback.message.text + (f"\n\n✅ <b>Перенос подтверждён</b>{cal_note}" if is_reschedule else f"\n\n✅ <b>Подтверждено</b>{cal_note}"),
             reply_markup=kb,
         )
         if booking_id:
@@ -780,13 +933,26 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("adm:no:"))
 async def admin_reject(callback: CallbackQuery, bot: Bot):
     client_id = int(callback.data.split(":")[2])
+    from src.services import settings_store as store
+    pending = store.pop_pending_booking(client_id)
+    is_reschedule = bool(pending and pending.get("kind") == "reschedule")
     try:
-        await bot.send_message(
-            client_id,
-            "К сожалению, эту заявку сейчас не можем принять. "
-            "Напишите, пожалуйста, другое время через /book."
-        )
-        await callback.message.edit_text(callback.message.text + "\n\n❌ <b>Отклонено</b>")
+        if is_reschedule:
+            await bot.send_message(
+                client_id,
+                "К сожалению, перенос на это время не можем принять.\n"
+                f"Старая запись на <b>{pending.get('old_date', '…')}</b> остаётся в силе.\n"
+                "Можно предложить другой слот через /reschedule или /book.",
+            )
+            footer = "\n\n❌ <b>Перенос отклонён</b> (старая запись сохранена)"
+        else:
+            await bot.send_message(
+                client_id,
+                "К сожалению, эту заявку сейчас не можем принять. "
+                "Напишите, пожалуйста, другое время через /book.",
+            )
+            footer = "\n\n❌ <b>Отклонено</b>"
+        await callback.message.edit_text(callback.message.text + footer)
     except Exception as e:
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
@@ -794,31 +960,27 @@ async def admin_reject(callback: CallbackQuery, bot: Bot):
 
 
 
-async def _clear_group_cancel_button(bot: Bot, b: dict, note: str = ""):
-    """Remove cancel button on group message if we stored its id."""
+async def _clear_group_cancel_button(
+    bot: Bot,
+    b: dict,
+    footer: str = "",
+    skip_message_id: int | None = None,
+):
+    """Remove cancel button on the original group booking message (if stored)."""
     chat_id = b.get("group_chat_id")
     msg_id = b.get("group_message_id")
     if not chat_id or not msg_id:
         return
+    if skip_message_id is not None and int(msg_id) == int(skip_message_id):
+        return
     try:
-        # append note by editing if possible
-        if note:
-            try:
-                from aiogram.exceptions import TelegramBadRequest
-            except Exception:
-                TelegramBadRequest = Exception
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=int(chat_id),
-                    message_id=int(msg_id),
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-            try:
-                await bot.send_message(int(chat_id), note)
-            except Exception:
-                pass
+        if footer:
+            # best effort: we cannot always get old text; strip keyboard only
+            await bot.edit_message_reply_markup(
+                chat_id=int(chat_id),
+                message_id=int(msg_id),
+                reply_markup=None,
+            )
         else:
             await bot.edit_message_reply_markup(
                 chat_id=int(chat_id),
@@ -846,9 +1008,22 @@ async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
         note = "Клиент уже отменил" if "client" in who else "Уже отменено"
         await callback.answer(note, show_alert=True)
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
+            base = callback.message.text or ""
+            if "Отменено" not in base and "отменена" not in base.lower():
+                await callback.message.edit_text(
+                    base + f"\n\n❌ <b>{note}</b>",
+                    reply_markup=None,
+                )
+            else:
+                await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
-            pass
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await _clear_group_cancel_button(
+            bot, existing, skip_message_id=callback.message.message_id
+        )
         return
     result = store.cancel_booking(booking_id, by="barber")
     if not result.get("ok"):
@@ -861,6 +1036,10 @@ async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
             pass
         return
     b = result["booking"]
+    try:
+        store.track_event("cancel_barber", int(b.get("user_id") or 0))
+    except Exception:
+        pass
     try:
         from src.services import calendar as gcal
         eid = b.get("calendar_event_id")
@@ -886,6 +1065,10 @@ async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+    # Also strip cancel button on the *other* message (confirm card vs /bookings card)
+    await _clear_group_cancel_button(
+        bot, b, skip_message_id=callback.message.message_id
+    )
     await callback.answer("Запись отменена")
 
 

@@ -14,6 +14,7 @@ router = Router()
 
 
 class SettingsStates(StatesGroup):
+    edit_capacity = State()
     edit_location = State()
     edit_prices = State()
     edit_hours = State()
@@ -111,6 +112,7 @@ def settings_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👋 Текст приветствия", callback_data="set:welcome")],
         [InlineKeyboardButton(text="🔔 Тексты напоминаний", callback_data="set:reminders")],
         [InlineKeyboardButton(text="🔒 Заблокированные дни", callback_data="set:blocked")],
+        [InlineKeyboardButton(text="📊 Лимит заявок/день", callback_data="set:capacity")],
         [InlineKeyboardButton(text="📋 Показать всё", callback_data="set:show")],
     ])
 
@@ -134,7 +136,7 @@ async def cmd_admin(message: Message):
         "/unblock_all — снять все блокировки\n"
         "/bookings — активные записи\n"
         "/bookings имя — поиск по клиенту\n"
-        "/cancel_id ID — отмена по ID\n\n"
+        "/cancel_id ID — отмена по ID\n/stats — статистика использования\n\n"
         f"Группа: <code>{get_admin_group() or '—'}</code>\n"
         f"Твой ID: <code>{message.from_user.id}</code>"
     )
@@ -485,6 +487,47 @@ async def save_reminder(message: Message, state: FSMContext):
     await message.answer("✅ Текст сохранён.")
 
 
+
+@router.callback_query(F.data == "set:capacity")
+async def settings_capacity(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    from src.services import settings_store as store
+    cur = store.get_max_bookings_per_day()
+    await state.set_state(SettingsStates.edit_capacity)
+    await callback.message.edit_text(
+        f"📊 <b>Лимит заявок на один день</b>\n\n"
+        f"Сейчас: <b>{cur}</b>\n\n"
+        f"Считаются: подтверждённые записи + ожидающие заявки на эту дату.\n"
+        f"Когда лимит достигнут — клиент не сможет выбрать этот день.\n\n"
+        f"Пришлите число, например <code>8</code> или <code>12</code>.\n"
+        f"/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_capacity)
+async def save_capacity(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    try:
+        n = int((message.text or "").strip())
+        if n < 1 or n > 100:
+            raise ValueError
+    except Exception:
+        await message.answer("Нужно целое число от 1 до 100.")
+        return
+    from src.services import settings_store as store
+    store.save_max_bookings_per_day(n)
+    await state.clear()
+    await message.answer(f"✅ Лимит заявок на день: <b>{n}</b>")
+
+
 @router.callback_query(F.data == "set:blocked")
 async def settings_blocked(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -534,7 +577,7 @@ async def cmd_block(message: Message):
         return
     key = to_display(d)
     from src.services import settings_store as store
-    store.block_day(key)
+    store.block_day(key, reason="block")
     await message.answer(f"🔒 День <b>{key}</b> заблокирован.")
 
 
@@ -581,11 +624,12 @@ async def cmd_vacation(message: Message):
         await message.answer(err)
         return
     from src.services import settings_store as store
-    store.block_range(to_display(start), to_display(end))
+    store.block_range(to_display(start), to_display(end), reason="vacation")
     count = (end - start).days + 1
     await message.answer(
-        f"🏖 Заблокировано <b>{count}</b> дн.\n"
-        f"{to_display(start)} → {to_display(end)}"
+        f"🏖 Отпуск: заблокировано <b>{count}</b> дн.\n"
+        f"{to_display(start)} → {to_display(end)}\n\n"
+        "Клиенты в эти дни увидят сообщение про отдых, не просто «день недоступен»."
     )
 
 
@@ -845,6 +889,11 @@ async def _bulk_cancel(bot: Bot, bookings: list) -> int:
             )
         except Exception as e:
             logger.error(f"bulk notify: {e}")
+        try:
+            from src.handlers.common import _clear_group_cancel_button
+            await _clear_group_cancel_button(bot, b2)
+        except Exception as e:
+            logger.error(f"bulk clear btn: {e}")
         n += 1
         if delay > 0:
             await asyncio.sleep(delay)
@@ -924,3 +973,11 @@ async def cmd_cancel_id(message: Message, bot: Bot):
         f"✅ Отменено: {b.get('date')} — {b.get('client_name') or b.get('user_id')}\n"
         f"💬 {b.get('comment')}"
     )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    await message.answer(store.get_stats_summary())
