@@ -289,42 +289,116 @@ def is_blocked(date_str: str) -> bool:
     return date_str in _day_reasons()
 
 
+def _parse_date_key(date_str: str):
+    from datetime import datetime
+    return datetime.strptime(date_str, "%d/%m/%Y").date()
+
+
+def get_vacation_ranges() -> list:
+    """List of {start, end} strings DD/MM/YYYY."""
+    runtime = get_runtime()
+    ranges = runtime.get("vacation_ranges", []) or []
+    out = []
+    for r in ranges:
+        if isinstance(r, dict) and r.get("start") and r.get("end"):
+            out.append({"start": r["start"], "end": r["end"]})
+    return out
+
+
+def _save_vacation_ranges(ranges: list):
+    runtime = get_runtime()
+    runtime["vacation_ranges"] = ranges
+    save_runtime(runtime)
+
+
+def _date_in_vacation_ranges(date_str: str) -> tuple[bool, str | None]:
+    """Return (is_vacation, range_end_display)."""
+    try:
+        d = _parse_date_key(date_str)
+    except Exception:
+        return False, None
+    for r in get_vacation_ranges():
+        try:
+            a = _parse_date_key(r["start"])
+            b = _parse_date_key(r["end"])
+        except Exception:
+            continue
+        if a <= d <= b:
+            return True, r["end"]
+    return False, None
+
+
 def get_day_close_reason(date_str: str) -> str | None:
-    """Return 'vacation', 'block', or None if open."""
+    """Return 'vacation', 'block', or None if open.
+
+    Vacation ranges win over per-day tags (so re-applied /vacation is reliable).
+    """
+    in_vac, _ = _date_in_vacation_ranges(date_str)
+    if in_vac:
+        return "vacation"
     return _day_reasons().get(date_str)
 
 
 def get_vacation_end_for(date_str: str) -> str | None:
-    """
-    If date is in a vacation stretch, return the last consecutive vacation day
-    (for client message «until X»).
-    """
+    """Last day of vacation covering this date (from ranges, else consecutive tags)."""
+    in_vac, end = _date_in_vacation_ranges(date_str)
+    if in_vac and end:
+        return end
     reasons = _day_reasons()
     if reasons.get(date_str) != "vacation":
         return None
-    from datetime import datetime, timedelta
-    cur = datetime.strptime(date_str, "%d/%m/%Y").date()
-    end = cur
+    from datetime import timedelta
+    cur = _parse_date_key(date_str)
+    end_d = cur
     while True:
-        nxt = end + timedelta(days=1)
+        nxt = end_d + timedelta(days=1)
         key = nxt.strftime("%d/%m/%Y")
         if reasons.get(key) == "vacation":
-            end = nxt
+            end_d = nxt
         else:
             break
-    return end.strftime("%d/%m/%Y")
+    return end_d.strftime("%d/%m/%Y")
 
 
 def block_day(date_str: str, reason: str = "block"):
     reasons = _day_reasons()
     reasons[date_str] = reason if reason in ("block", "vacation") else "block"
     _save_day_reasons(reasons)
+    # single-day block should not stay inside a vacation range message by accident:
+    # only remove this day from ranges if reason is block
+    if reason == "block":
+        _punch_day_from_vacation_ranges(date_str)
+
+
+def _punch_day_from_vacation_ranges(date_str: str):
+    """If date sits in a vacation range, split/remove so reason=block wins for that day."""
+    try:
+        d = _parse_date_key(date_str)
+    except Exception:
+        return
+    from datetime import timedelta
+    new_ranges = []
+    for r in get_vacation_ranges():
+        try:
+            a = _parse_date_key(r["start"])
+            b = _parse_date_key(r["end"])
+        except Exception:
+            continue
+        if d < a or d > b:
+            new_ranges.append(r)
+            continue
+        if a <= d - timedelta(days=1):
+            new_ranges.append({"start": a.strftime("%d/%m/%Y"), "end": (d - timedelta(days=1)).strftime("%d/%m/%Y")})
+        if d + timedelta(days=1) <= b:
+            new_ranges.append({"start": (d + timedelta(days=1)).strftime("%d/%m/%Y"), "end": b.strftime("%d/%m/%Y")})
+    _save_vacation_ranges(new_ranges)
 
 
 def unblock_day(date_str: str):
     reasons = _day_reasons()
     reasons.pop(date_str, None)
     _save_day_reasons(reasons)
+    _punch_day_from_vacation_ranges(date_str)
 
 
 def block_range(start_str: str, end_str: str, reason: str = "vacation"):
@@ -338,6 +412,11 @@ def block_range(start_str: str, end_str: str, reason: str = "vacation"):
         reasons[cur.strftime("%d/%m/%Y")] = r
         cur += timedelta(days=1)
     _save_day_reasons(reasons)
+    if r == "vacation":
+        ranges = get_vacation_ranges()
+        ranges.append({"start": start_str, "end": end_str})
+        # merge overlapping later if needed; append is enough for message lookup
+        _save_vacation_ranges(ranges)
 
 
 def unblock_range(start_str: str, end_str: str) -> int:
@@ -355,6 +434,25 @@ def unblock_range(start_str: str, end_str: str) -> int:
             removed += 1
         cur += timedelta(days=1)
     _save_day_reasons(reasons)
+    # drop vacation ranges fully inside or overlapping this unvacation window
+    kept = []
+    for r in get_vacation_ranges():
+        try:
+            a = _parse_date_key(r["start"])
+            b = _parse_date_key(r["end"])
+        except Exception:
+            continue
+        if b < start or a > end:
+            kept.append(r)
+            continue
+        # trim left/right remnants
+        if a < start:
+            from datetime import timedelta as td
+            kept.append({"start": a.strftime("%d/%m/%Y"), "end": (start - td(days=1)).strftime("%d/%m/%Y")})
+        if b > end:
+            from datetime import timedelta as td
+            kept.append({"start": (end + td(days=1)).strftime("%d/%m/%Y"), "end": b.strftime("%d/%m/%Y")})
+    _save_vacation_ranges(kept)
     return removed
 
 
@@ -364,6 +462,7 @@ def clear_all_blocked() -> int:
     count = len(reasons)
     runtime["day_reasons"] = {}
     runtime["blocked_days"] = []
+    runtime["vacation_ranges"] = []
     save_runtime(runtime)
     return count
 
