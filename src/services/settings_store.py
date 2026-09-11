@@ -246,11 +246,11 @@ def save_client_contact_name(telegram_id: int, name: str):
     save_runtime(runtime)
 
 
-def format_client_line(telegram_id: int, tg_full_name) -> str:
-    """Line for group messages: Telegram name + optional contact name + last services."""
+def format_client_line(telegram_id: int, tg_full_name, ref_date: str = "") -> str:
+    """Line for group messages: Telegram name + contact + one relevant past visit."""
     tg = tg_full_name or "Клиент"
     contact = get_client_contact_name(telegram_id)
-    last = format_last_services_line(telegram_id, limit=3)
+    last = format_last_services_line(telegram_id, ref_date=ref_date or "")
     if contact:
         return f"👤 {tg}\n📱 В контактах: <b>{contact}</b>\n🗂 {last}"
     return f"👤 {tg}\n🗂 {last}"
@@ -258,45 +258,86 @@ def format_client_line(telegram_id: int, tg_full_name) -> str:
 
 # ---------- Blocked days (persist) ----------
 
-def get_blocked_days() -> set:
+def _day_reasons(runtime: dict | None = None) -> dict:
+    """
+    Map DD/MM/YYYY -> 'block' | 'vacation'.
+    Migrates legacy blocked_days list (treated as simple block).
+    """
+    runtime = runtime if runtime is not None else get_runtime()
+    reasons = dict(runtime.get("day_reasons", {}) or {})
+    legacy = runtime.get("blocked_days", []) or []
+    for d in legacy:
+        if d not in reasons:
+            reasons[d] = "block"
+    return reasons
+
+
+def _save_day_reasons(reasons: dict):
     runtime = get_runtime()
-    days = runtime.get("blocked_days", []) or []
-    return set(days)
+    # keep blocked_days in sync for older code paths
+    runtime["day_reasons"] = reasons
+    runtime["blocked_days"] = sorted(reasons.keys())
+    save_runtime(runtime)
+
+
+def get_blocked_days() -> set:
+    return set(_day_reasons().keys())
 
 
 def is_blocked(date_str: str) -> bool:
-    """date_str in DD/MM/YYYY"""
-    return date_str in get_blocked_days()
+    """date_str in DD/MM/YYYY — any closed day (block or vacation)."""
+    return date_str in _day_reasons()
 
 
-def block_day(date_str: str):
-    runtime = get_runtime()
-    days = set(runtime.get("blocked_days", []) or [])
-    days.add(date_str)
-    runtime["blocked_days"] = sorted(days)
-    save_runtime(runtime)
+def get_day_close_reason(date_str: str) -> str | None:
+    """Return 'vacation', 'block', or None if open."""
+    return _day_reasons().get(date_str)
+
+
+def get_vacation_end_for(date_str: str) -> str | None:
+    """
+    If date is in a vacation stretch, return the last consecutive vacation day
+    (for client message «until X»).
+    """
+    reasons = _day_reasons()
+    if reasons.get(date_str) != "vacation":
+        return None
+    from datetime import datetime, timedelta
+    cur = datetime.strptime(date_str, "%d/%m/%Y").date()
+    end = cur
+    while True:
+        nxt = end + timedelta(days=1)
+        key = nxt.strftime("%d/%m/%Y")
+        if reasons.get(key) == "vacation":
+            end = nxt
+        else:
+            break
+    return end.strftime("%d/%m/%Y")
+
+
+def block_day(date_str: str, reason: str = "block"):
+    reasons = _day_reasons()
+    reasons[date_str] = reason if reason in ("block", "vacation") else "block"
+    _save_day_reasons(reasons)
 
 
 def unblock_day(date_str: str):
-    runtime = get_runtime()
-    days = set(runtime.get("blocked_days", []) or [])
-    days.discard(date_str)
-    runtime["blocked_days"] = sorted(days)
-    save_runtime(runtime)
+    reasons = _day_reasons()
+    reasons.pop(date_str, None)
+    _save_day_reasons(reasons)
 
 
-def block_range(start_str: str, end_str: str):
+def block_range(start_str: str, end_str: str, reason: str = "vacation"):
     from datetime import datetime, timedelta
     start = datetime.strptime(start_str, "%d/%m/%Y").date()
     end = datetime.strptime(end_str, "%d/%m/%Y").date()
-    runtime = get_runtime()
-    days = set(runtime.get("blocked_days", []) or [])
+    reasons = _day_reasons()
+    r = reason if reason in ("block", "vacation") else "vacation"
     cur = start
     while cur <= end:
-        days.add(cur.strftime("%d/%m/%Y"))
+        reasons[cur.strftime("%d/%m/%Y")] = r
         cur += timedelta(days=1)
-    runtime["blocked_days"] = sorted(days)
-    save_runtime(runtime)
+    _save_day_reasons(reasons)
 
 
 def unblock_range(start_str: str, end_str: str) -> int:
@@ -304,38 +345,131 @@ def unblock_range(start_str: str, end_str: str) -> int:
     from datetime import datetime, timedelta
     start = datetime.strptime(start_str, "%d/%m/%Y").date()
     end = datetime.strptime(end_str, "%d/%m/%Y").date()
-    runtime = get_runtime()
-    days = set(runtime.get("blocked_days", []) or [])
+    reasons = _day_reasons()
     removed = 0
     cur = start
     while cur <= end:
         key = cur.strftime("%d/%m/%Y")
-        if key in days:
-            days.discard(key)
+        if key in reasons:
+            del reasons[key]
             removed += 1
         cur += timedelta(days=1)
-    runtime["blocked_days"] = sorted(days)
-    save_runtime(runtime)
+    _save_day_reasons(reasons)
     return removed
 
 
 def clear_all_blocked() -> int:
     runtime = get_runtime()
-    count = len(runtime.get("blocked_days", []) or [])
+    reasons = _day_reasons(runtime)
+    count = len(reasons)
+    runtime["day_reasons"] = {}
     runtime["blocked_days"] = []
     save_runtime(runtime)
     return count
 
 
+# ---------- Daily capacity (max requests per day) ----------
+
+def get_max_bookings_per_day() -> int:
+    runtime = get_runtime()
+    try:
+        return max(1, int(runtime.get("max_bookings_per_day", 8)))
+    except Exception:
+        return 8
+
+
+def save_max_bookings_per_day(n: int):
+    runtime = get_runtime()
+    runtime["max_bookings_per_day"] = max(1, int(n))
+    save_runtime(runtime)
+
+
+def count_demand_for_date(date_str: str) -> int:
+    """
+    How many slots are already taken for this calendar day:
+    active confirmed bookings + pending requests for that date.
+    """
+    n = 0
+    for b in get_all_active_bookings():
+        if (b.get("date") or "") == date_str:
+            n += 1
+    runtime = get_runtime()
+    pending = runtime.get("pending_bookings", {}) or {}
+    for _uid, p in pending.items():
+        if isinstance(p, dict) and (p.get("date") or "") == date_str:
+            n += 1
+    return n
+
+
+def is_day_full(date_str: str) -> bool:
+    return count_demand_for_date(date_str) >= get_max_bookings_per_day()
+
+
+def client_unavailable_message(date_str: str, lang: str = "ru") -> str:
+    """Friendly text when day is closed (vacation vs simple block) or full."""
+    reason = get_day_close_reason(date_str)
+    if reason == "vacation":
+        until = get_vacation_end_for(date_str) or date_str
+        if lang == "lv":
+            return (
+                f"Paldies par interesi! 🙏\n\n"
+                f"Diemžēl līdz <b>{until}</b> esmu atpūtā / atvaļinājumā.\n"
+                f"Tu vari pierakstīties uz datumu <b>pēc {until}</b> — "
+                f"tiklīdz būšu atpakaļ, apskatīšu pieteikumus.\n\n"
+                f"Uz drīzu tikšanos!\nTavs labākais bārddzinis ✂️"
+            )
+        return (
+            f"Спасибо за интерес! 🙏\n\n"
+            f"К сожалению, до <b>{until}</b> я на отдыхе / в отпуске.\n"
+            f"Можно записаться на дату <b>после {until}</b> — "
+            f"как вернусь, посмотрю заявки.\n\n"
+            f"До скорой встречи!\nВаш лучший барбер ✂️"
+        )
+    if reason == "block":
+        if lang == "lv":
+            return (
+                f"Šī diena (<b>{date_str}</b>) nav pieejama pierakstam.\n"
+                f"Lūdzu, izvēlieties citu dienu."
+            )
+        return (
+            f"Этот день (<b>{date_str}</b>) недоступен для записи.\n"
+            f"Пожалуйста, выберите другой день."
+        )
+    # capacity full (not closed)
+    limit = get_max_bookings_per_day()
+    if lang == "lv":
+        return (
+            f"Uz <b>{date_str}</b> jau ir pietiekami daudz pieteikumu "
+            f"(limits ~{limit}).\n"
+            f"Lūdzu, izvēlieties citu dienu vai rakstiet caur /contact."
+        )
+    return (
+        f"На <b>{date_str}</b> уже достаточно заявок "
+        f"(лимит ~{limit}).\n"
+        f"Пожалуйста, выберите другой день или напишите через /contact."
+    )
+
+
 # ---------- Pending bookings (for confirm → calendar) ----------
 
-def save_pending_booking(user_id: int, date_str: str, comment: str, client_name: str = ""):
+def save_pending_booking(
+    user_id: int,
+    date_str: str,
+    comment: str,
+    client_name: str = "",
+    kind: str = "book",
+    reschedule_id: str = "",
+    old_date: str = "",
+):
     runtime = get_runtime()
     pending = runtime.get("pending_bookings", {}) or {}
     pending[str(user_id)] = {
         "date": date_str,
         "comment": comment,
         "client_name": client_name,
+        "kind": kind or "book",
+        "reschedule_id": reschedule_id or "",
+        "old_date": old_date or "",
     }
     runtime["pending_bookings"] = pending
     save_runtime(runtime)
@@ -398,30 +532,137 @@ def cancel_service_history(user_id: int, booking_id: str = "", date_str: str = "
     save_runtime(runtime)
 
 
-def get_last_services(user_id: int, limit: int = 3) -> list:
-    """Return last N *active* services, newest first."""
+def _parse_ddmmyyyy(s: str):
+    try:
+        parts = (s or "").strip().split("/")
+        if len(parts) != 3:
+            return None
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        from datetime import date
+        return date(y, m, d)
+    except Exception:
+        return None
+
+
+def get_all_active_services(user_id: int) -> list:
+    """All active history entries, newest first (by date when parseable)."""
     runtime = get_runtime()
     history = runtime.get("service_history", {}) or {}
     entries = history.get(str(user_id), [])
     if not isinstance(entries, list):
         return []
     active = [e for e in entries if e.get("status", "active") != "cancelled"]
-    return list(reversed(active[-limit:]))
+
+    def sort_key(e):
+        d = _parse_ddmmyyyy(e.get("date") or "")
+        # newest first; undated go last
+        return (0, d.toordinal()) if d else (1, 0)
+
+    active_sorted = sorted(active, key=sort_key, reverse=True)
+    return active_sorted
 
 
-def format_last_services_line(user_id: int, limit: int = 3) -> str:
-    items = get_last_services(user_id, limit=limit)
-    if not items:
-        return "Last time used services: —"
-    parts = []
+def get_last_services(user_id: int, limit: int = 3) -> list:
+    """Return last N *active* services, newest first."""
+    return get_all_active_services(user_id)[: max(0, limit)]
+
+
+def filter_services_by_date(
+    user_id: int,
+    date_from: str = "",
+    date_to: str = "",
+) -> list:
+    """Active services within [date_from, date_to] inclusive (DD/MM/YYYY). Empty bound = open."""
+    items = get_all_active_services(user_id)
+    d_from = _parse_ddmmyyyy(date_from) if date_from else None
+    d_to = _parse_ddmmyyyy(date_to) if date_to else None
+    out = []
     for e in items:
-        svc = e.get("service", "—")
-        dt = e.get("date", "")
-        if dt:
-            parts.append(f"{svc} ({dt})")
-        else:
-            parts.append(svc)
-    return "Last time used services: " + "; ".join(parts)
+        ed = _parse_ddmmyyyy(e.get("date") or "")
+        if d_from and (not ed or ed < d_from):
+            continue
+        if d_to and (not ed or ed > d_to):
+            continue
+        out.append(e)
+    return out
+
+
+def get_history_page(
+    user_id: int,
+    page: int = 0,
+    page_size: int = 5,
+    date_from: str = "",
+    date_to: str = "",
+) -> dict:
+    """Paginated history. Returns items, page, total_pages, total."""
+    if date_from or date_to:
+        items = filter_services_by_date(user_id, date_from, date_to)
+    else:
+        items = get_all_active_services(user_id)
+    total = len(items)
+    page_size = max(1, page_size)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * page_size : (page + 1) * page_size]
+    return {
+        "items": chunk,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "total": total,
+    }
+
+
+def get_relevant_past_service(user_id: int, ref_date: str = "") -> dict | None:
+    """
+    One visit for barber context on a booking request:
+    - ref_date set → closest visit on or before that date
+    - else → most recent active visit
+    """
+    all_active = get_all_active_services(user_id)
+    if not all_active:
+        return None
+    ref = _parse_ddmmyyyy(ref_date) if ref_date else None
+    if not ref:
+        return all_active[0]
+    best = None
+    best_delta = None
+    for e in all_active:
+        ed = _parse_ddmmyyyy(e.get("date") or "")
+        if not ed or ed > ref:
+            continue
+        delta = (ref - ed).days
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best = e
+    return best or all_active[0]
+
+
+def format_last_services_line(user_id: int, limit: int = 1, ref_date: str = "") -> str:
+    """Single relevant past visit for group booking cards."""
+    e = get_relevant_past_service(user_id, ref_date=ref_date)
+    if not e:
+        return "Last time used services: —"
+    svc = e.get("service", "—")
+    dt = e.get("date", "")
+    if dt and ref_date:
+        ref = _parse_ddmmyyyy(ref_date)
+        ed = _parse_ddmmyyyy(dt)
+        if ref and ed:
+            days = (ref - ed).days
+            if days == 0:
+                ago = "в тот же день"
+            elif days == 1:
+                ago = "1 день назад"
+            elif days < 30:
+                ago = f"{days} дн. назад"
+            else:
+                ago = f"~{days // 7} нед. назад"
+            return f"Last time used services: {svc} ({dt}, {ago})"
+        return f"Last time used services: {svc} ({dt})"
+    if dt:
+        return f"Last time used services: {svc} ({dt})"
+    return f"Last time used services: {svc}"
 
 
 # ---------- Confirmed bookings (for reminders) ----------
@@ -594,3 +835,64 @@ def find_active_bookings(query: str) -> list:
         if q in hay:
             results.append(b)
     return results
+
+
+# ---------- Simple analytics ----------
+
+def track_event(event: str, user_id: int | None = None):
+    """Increment counters for funnel stats."""
+    from datetime import datetime
+    with _BOOKING_LOCK:
+        runtime = get_runtime()
+        stats = runtime.get("stats", {}) or {}
+        stats["total_" + event] = int(stats.get("total_" + event, 0)) + 1
+        users_key = "users_" + event
+        users = set(stats.get(users_key, []) or [])
+        if user_id is not None:
+            users.add(str(user_id))
+        # keep list compact
+        stats[users_key] = list(users)[-5000:]
+        day = datetime.now().strftime("%Y-%m-%d")
+        daily = stats.get("daily", {}) or {}
+        day_bucket = daily.get(day, {}) or {}
+        day_bucket[event] = int(day_bucket.get(event, 0)) + 1
+        daily[day] = day_bucket
+        # keep last 60 days
+        for k in sorted(daily.keys())[:-60]:
+            daily.pop(k, None)
+        stats["daily"] = daily
+        runtime["stats"] = stats
+        save_runtime(runtime)
+
+
+def get_stats_summary() -> str:
+    runtime = get_runtime()
+    stats = runtime.get("stats", {}) or {}
+    def n(event):
+        return int(stats.get("total_" + event, 0))
+    def u(event):
+        return len(stats.get("users_" + event, []) or [])
+    lines = [
+        "📊 <b>Статистика бота</b>",
+        "",
+        f"▶️ /start: <b>{n('start')}</b> (уник. {u('start')})",
+        f"📝 Заявки: <b>{n('book_request')}</b> (уник. {u('book_request')})",
+        f"✅ Подтверждено: <b>{n('booking_confirmed')}</b>",
+        f"📅 Запросы переноса: <b>{n('reschedule_request')}</b>",
+        f"✅ Переносы приняты: <b>{n('reschedule_confirmed')}</b>",
+        f"❌ Отмены клиент: <b>{n('cancel_client')}</b>",
+        f"❌ Отмены барбер: <b>{n('cancel_barber')}</b>",
+        "",
+        f"Активных записей сейчас: <b>{len(get_all_active_bookings())}</b>",
+    ]
+    daily = stats.get("daily", {}) or {}
+    if daily:
+        last_days = sorted(daily.keys())[-7:]
+        lines.append("")
+        lines.append("<b>Последние 7 дней</b> (start / book / confirm):")
+        for d in last_days:
+            b = daily[d]
+            lines.append(
+                f"• {d}: {b.get('start', 0)} / {b.get('book_request', 0)} / {b.get('booking_confirmed', 0)}"
+            )
+    return "\n".join(lines)
