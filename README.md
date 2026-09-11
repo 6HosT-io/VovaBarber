@@ -15,52 +15,96 @@ Date format everywhere: **DD/MM/YYYY** (fixed).
 |--------|-----|
 | Start | `/start` — welcome (from `/settings` or built-in) + privacy note + optional `assets/welcome.png` |
 | Book | **Записаться** / `/book` — Today / Tomorrow / Day after / Other date + comment |
+| Reschedule | **📅 Перенести запись** / `/reschedule` — request goes to group for barber **accept / reject** (old booking stays until accepted) |
 | Prices | **Цены** / `/prices` |
-| History | **История** / `/history` — only **active** (not cancelled) visits |
-| Contact | **Связаться** / `/contact` — free text → admin group |
+| History | **История** / `/history` — active visits only, **paginated** (5 per page) |
+| Contact | **Связаться** / `/contact` — free text → admin group (private chats only; group messages are ignored) |
 | Cancel step | `/cancel` — stops current wizard only |
-| Cancel appointment | **❌ Отменить запись** / `/cancel_booking` — cancels confirmed booking (pick if several) |
+| Cancel appointment | **❌ Отменить запись** / `/cancel_booking` — confirmed booking (pick if several) |
 | Language | **Language / Valoda** — RU ↔ LV |
 
-Public slash menu: `start`, `book`, `prices`, `history`, `contact`, `cancel`, `cancel_booking`, `help`.  
-Admin commands are **hidden** from normal users (no reply if they type them).
+Public slash menu includes: `start`, `book`, `prices`, `history`, `contact`, `cancel`, `cancel_booking`, `reschedule`, `help`.  
+Admin commands are **hidden** from normal users (no reply).
+
+Closed days and full days: client gets a clear message (see **Block vs vacation** and **Daily capacity** below) and cannot complete a request for that date.
 
 ---
 
 ## Admin private group
 
-Every booking request, free-text message and client cancel is posted here.
+Every booking request, reschedule request, free-text message and client cancel is posted here.
 
 Shown for each client:
 
 - Telegram name  
 - **В контактах** (if saved)  
-- **Last time used services** (active history only)  
+- **Last time used services** — **one** relevant past visit (closest on or before the request date, with “N days ago” when possible)  
 - Day + comment  
 
-**Buttons on new request**
+**Buttons on new request / reschedule**
 
 | Button | Effect |
 |--------|--------|
-| ✅ Подтвердить | Client gets confirmation + address + phone; booking enters reminders; optional Google Calendar; history updated; button **❌ Отменить эту запись** appears on the group message |
-| ❌ Отклонить | Client gets decline (request was never confirmed) |
+| ✅ Подтвердить / Подтвердить перенос | Client notified; reminders; optional Google Calendar; history updated; **❌ Отменить эту запись** on the group message |
+| ❌ Отклонить | New booking declined; for **reschedule** — old booking **stays** |
 | 💬 Написать клиенту | Open chat |
-| 📝 Имя в контактах | Save barber’s phone nickname for this client |
+| 📝 Имя в контактах | Save barber’s phone nickname |
 
-**After confirm:** group message keeps **❌ Отменить эту запись** for that specific booking.
+Group Privacy (BotFather): enable so normal chat in the admin group is **not** re-forwarded by the bot. Free-text handler only runs in **private** client chats.
 
 ---
 
-## Cancel rules
+## Cancel rules (idempotent)
 
 | Who | How | Result |
 |-----|-----|--------|
-| Barber | Group button after confirm, or `/bookings` → cancel, or `/cancel_id ID` | Client notified; history entry removed from “last services”; reminders stopped; Calendar event deleted if any |
-| Client | `/cancel_booking` or menu button | Same cleanup; admin group notified |
-| Client (several bookings) | Bot shows a list with a cancel button per date | Only the chosen one is cancelled |
-| «Нужно перенести» on reminder | Treated as cancel of that slot | Group notified |
+| Barber | Group button, `/bookings`, or `/cancel_id ID` | Client gets “Барбер отменил…”; history cleaned; reminders stop; Calendar event removed if any |
+| Client | `/cancel_booking` or menu button | Client gets “Вы отменили…”; group notified |
+| Second cancel of same booking | Any path | **No** second client notify; alert “Уже отменено” / “Клиент уже отменил”; buttons stripped |
 
-Cancelled visits **do not** appear in `/history` or “Last time used services”.
+Cancel is locked in store (threading + file lock). Status is the source of truth; extra UI buttons on old messages do not re-cancel.
+
+---
+
+## Reschedule (= same flow as book)
+
+1. Client chooses booking → new day → comment  
+2. Group gets **Запрос на перенос** (old date → new date)  
+3. Barber **confirms** or **rejects**  
+4. Until then, the **old** appointment remains active  
+
+---
+
+## Block vs vacation (different client texts)
+
+| Command | Stored as | Client message |
+|---------|-----------|----------------|
+| `/block DD/MM/YYYY` | simple **block** | Short: day unavailable, pick another |
+| `/vacation START END` | **vacation** range | Friendly: on break until **last vacation day**, can book **after** that date |
+| `/unblock` / `/unvacation` / `/unblock_all` | open days again | — |
+
+Legacy days in `blocked_days` without a reason are treated as **block**.
+
+Examples:
+
+```
+/block 25/09/2026
+/vacation 06/09/2026 21/09/2026
+/unvacation 15/09/2026 21/09/2026
+/unblock_all
+```
+
+---
+
+## Daily capacity (anti-overload)
+
+Configurable without code changes:
+
+- `/settings` → **📊 Лимит заявок/день** (default **8**)  
+- Counts **confirmed** + **pending** requests for that calendar date  
+- When full → client cannot select that day (capacity message)
+
+Use this so “tomorrow” cannot collect 30 open requests for a solo barber.
 
 ---
 
@@ -68,19 +112,13 @@ Cancelled visits **do not** appear in `/history` or “Last time used services�
 
 ```
 /bookings              — all active confirmed appointments
-/bookings Саша         — search by Telegram name, contact name, date, comment, id
-/cancel_id 1724…       — cancel one booking by ID
+/bookings Саша         — search by name, contact, date, comment, id
+/cancel_id 1724…       — cancel by ID
 ```
 
-**List features**
-
-- Pagination: **5** per page, ◀️ ▶️  
-- Per card: cancel this booking + write to client  
-- **❌ Отменить все на странице** (with confirmation)  
-- **❌ Отменить все найденные** (if search was used)  
-- **❌ Отменить ВСЕ активные** (with confirmation)  
-
-Bulk cancel notifies each client and cleans history / reminders / Calendar.
+- Pagination: **5** per page  
+- Per card: cancel + write to client  
+- Bulk: cancel page / all found / all active (with confirmation)  
 
 ---
 
@@ -89,69 +127,46 @@ Bulk cancel notifies each client and cleans history / reminders / Calendar.
 | Command | Purpose |
 |---------|---------|
 | `/admin` `/panel` | Admin menu |
-| `/settings` | Prices, hours, address, welcome & reminder texts, blocked days |
-| `/test_group` | Test message to the admin group |
-| `/bookings` `/active` | Active appointments (+ search) |
+| `/settings` | Prices, hours, address, welcome & reminder texts, blocked days, **daily capacity** |
+| `/test_group` | Test message to admin group |
+| `/bookings` `/active` | Active appointments (+ search, pagination, bulk cancel) |
 | `/cancel_id ID` | Cancel by booking ID |
-| `/block DD/MM/YYYY` | Block one day |
-| `/unblock DD/MM/YYYY` | Unblock one day |
-| `/vacation START END` | Block range (max 90 days) |
-| `/unvacation START END` | Unblock range |
-| `/unblock_all` | Clear all blocked days |
-
-Examples:
-
-```
-/block 25/08/2026
-/vacation 01/09/2026 14/09/2026
-/unvacation 08/09/2026 14/09/2026
-/bookings
-/bookings 25/08
-/cancel_id 1724123456789
-```
+| `/stats` | Usage counters (starts, requests, confirms, cancels, reschedules) |
+| `/block` `/unblock` | One day (simple block) |
+| `/vacation` `/unvacation` | Date range (vacation reason) |
+| `/unblock_all` | Clear all closed days |
 
 ---
 
 ## Reminders
 
-Run inside the same bot process (started with the service).
-
 | When | Behaviour |
 |------|-----------|
 | ~24h before | Window **20–28 hours** before appointment time |
-| Morning | Same calendar day, after **08:00** Europe/Riga, only if client did **not** press «Да, буду» |
+| Morning | Same day after **08:00** Europe/Riga, only if client did **not** press «Да, буду» |
 
-**Buttons on reminder**
-
-- ✅ **Да, буду** — morning reminder skipped  
-- 🤔 **Подумаю** — morning reminder still sent  
-- 📅 **Нужно перенести** — cancels slot, notifies group  
-
-Time is taken from the client comment (`16:00`, `около 11`, …). Default **10:00** if missing. Duration default **45 min**.  
+Buttons: ✅ Да, буду · 🤔 Подумаю · 📅 Нужно перенести (starts reschedule flow).  
 Texts editable in `/settings`. Timezone: `Europe/Riga`.
 
 ---
 
-## Settings (`/settings`)
-
-Stored in `config/runtime_settings.yaml` (survives restart):
+## Settings (`/settings`) → `config/runtime_settings.yaml`
 
 - Service prices and durations  
-- Working hours  
-- Address  
-- Welcome texts (RU/LV)  
-- Reminder texts (RU/LV)  
-- Client contact nicknames (`client_names`)  
-- Service history (`service_history`) — cancelled entries marked, not shown  
-- Blocked days (`blocked_days`)  
-- Pending + confirmed bookings (for confirm / reminders / cancel)  
+- Working hours, address  
+- Welcome & reminder texts (RU/LV)  
+- Client contact nicknames  
+- Service history (cancelled hidden from “last services” and client history)  
+- Closed days + reasons (`block` / `vacation`)  
+- **max_bookings_per_day**  
+- Pending + confirmed bookings  
+- Simple **stats** counters  
 
 ---
 
 ## Google Calendar (optional)
 
-On **Confirm**, bot can create an event. On cancel, it tries to delete it.
-
+On confirm: create event. On cancel: try delete.  
 Guide: `docs/Google_Calendar_Setup.md`
 
 ```env
@@ -174,6 +189,7 @@ TIMEZONE=Europe/Riga
 # Optional
 # GOOGLE_CALENDAR_ID=primary
 # GOOGLE_CREDENTIALS_FILE=config/google_credentials.json
+# NOTIFY_DELAY_SEC=0.35
 ```
 
 ---
@@ -195,8 +211,7 @@ python -m src.bot
 
 ## Production: Hetzner Cloud
 
-- **Ubuntu 24.04**, location **Falkenstein (FSN)** or **Helsinki (HEL)**  
-- Plan e.g. **CX23** (2 vCPU / 4 GB)  
+- **Ubuntu 24.04**, Falkenstein (FSN) or Helsinki (HEL)  
 - Path: `/opt/VovaBarbershopBot`  
 - Unit: **`VovaBarbershopBot.service`**  
 - Python **3.12** in venv  
@@ -217,25 +232,19 @@ rsync -avz --exclude venv --exclude __pycache__ --exclude .git \
 ssh root@SERVER_IP 'systemctl restart VovaBarbershopBot'
 ```
 
-### Firewall
+Do **not** overwrite `runtime_settings.yaml` on deploy (prices, blocks, history, capacity live there).
 
-Inbound **TCP 22** (SSH). Later for webhooks: **80**, **443**.  
-Hetzner Cloud Firewall and/or UFW.
+### Firewall / webhooks later
 
-### Webhooks later
-
-Same VPS: domain + nginx + Let’s Encrypt, then switch bot from long polling to webhook.
+Inbound **22** (SSH); later **80/443** for HTTPS webhook on the same VPS.
 
 ---
 
 ## BotFather
 
-- `/setabouttext`, `/setdescription`  
-- Description picture **640×360**  
-- Botpic — square  
-- Privacy Policy URL — optional; bot includes a short privacy note on `/start` and `/contact`  
-
-Optional photo: `assets/welcome.png`.
+- About / description / 640×360 picture / botpic  
+- **Group Privacy = Enable** (recommended) so admin group chat is not treated as client free-text  
+- Privacy Policy URL optional; short note already on `/start` and `/contact`  
 
 ---
 
@@ -245,20 +254,16 @@ Optional photo: `assets/welcome.png`.
 VovaBarbershopBot/
 ├── assets/welcome.png
 ├── config/
-│   ├── .env
-│   ├── .env.example
-│   ├── services.yaml
-│   ├── settings.yaml
-│   ├── texts_ru.yaml / texts_lv.yaml
-│   ├── runtime_settings.yaml
-│   └── google_credentials.json      # optional
-├── docs/
-│   └── Google_Calendar_Setup.md
+│   ├── .env / .env.example
+│   ├── services.yaml, settings.yaml, texts_*.yaml
+│   ├── runtime_settings.yaml      # live data — keep on server
+│   └── google_credentials.json    # optional
+├── docs/Google_Calendar_Setup.md
 ├── src/
 │   ├── bot.py
-│   ├── handlers/                    # common + admin
+│   ├── handlers/                  # common + admin
 │   ├── keyboards/
-│   └── services/                    # settings_store, calendar, reminders
+│   └── services/                  # settings_store, calendar, reminders
 └── requirements.txt
 ```
 
@@ -267,14 +272,17 @@ VovaBarbershopBot/
 ## Not fully live yet
 
 - Telegram Mini App  
+- Per-hour time slots (capacity is **per calendar day**)  
 
 ---
 
 ## Partner pin (admin group) — short
 
-Clients write to the bot; requests land in this group.  
-Confirm / reject / write / save contact name / cancel confirmed booking from the message.  
-`/bookings` — list & search & bulk cancel.  
-`/block` `/vacation` — close days. Format **DD/MM/YYYY**.  
-`/settings` — prices, hours, texts.  
-Reminders: 24h + morning; «Да, буду» skips morning.
+Клиенты пишут боту; заявки и переносы приходят сюда.  
+✅ / ❌ / написать / имя в контактах / отмена после подтверждения.  
+`/bookings` — список, поиск, пагинация, массовая отмена.  
+`/block` — день закрыт (короткий ответ клиенту).  
+`/vacation` — отпуск (текст про отдых до конечной даты).  
+`/settings` — цены, часы, лимит заявок на день.  
+Формат дат: **ДД/ММ/ГГГГ**.  
+`/stats` — сколько стартов и заявок.
