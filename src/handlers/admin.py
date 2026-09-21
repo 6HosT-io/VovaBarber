@@ -41,6 +41,17 @@ def is_admin(user_id: int) -> bool:
     return user_id in get_admin_ids()
 
 
+async def require_admin_cb(callback: CallbackQuery) -> bool:
+    """Group/settings buttons: only ADMIN_IDS. Show alert if not."""
+    if is_admin(callback.from_user.id):
+        return True
+    await callback.answer(
+        "⛔ Только админы (вы и барбер) могут нажать эту кнопку.",
+        show_alert=True,
+    )
+    return False
+
+
 def parse_ddmmyyyy(text: str):
     """Parse DD/MM/YYYY or DD.MM.YYYY. Returns date or None."""
     text = (text or "").strip().replace(".", "/").replace("-", "/")
@@ -194,8 +205,7 @@ async def cmd_test_group(message: Message):
 
 @router.callback_query(F.data == "set:show")
 async def settings_show(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     try:
         from src.services import settings_store as store
@@ -223,8 +233,7 @@ async def settings_show(callback: CallbackQuery):
 
 @router.callback_query(F.data == "set:location")
 async def settings_location(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     current = store.get_location()
@@ -252,8 +261,7 @@ async def save_location(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set:prices")
 async def settings_prices(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     current = store.format_services_text("ru")
@@ -316,8 +324,7 @@ async def save_prices(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set:hours")
 async def settings_hours(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     current = store.format_hours_text()
@@ -371,8 +378,7 @@ async def save_hours(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set:welcome")
 async def settings_welcome(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -490,8 +496,7 @@ async def save_reminder(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set:capacity")
 async def settings_capacity(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     cur = store.get_max_bookings_per_day()
@@ -551,6 +556,8 @@ async def settings_blocked(callback: CallbackQuery):
 
 @router.callback_query(F.data == "set:back")
 async def settings_back(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
+        return
     await state.clear()
     await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\nФормат даты: ДД/ММ/ГГГГ\nВыберите раздел:",
@@ -801,8 +808,7 @@ async def cmd_bookings(message: Message):
 
 @router.callback_query(F.data.startswith("bk:p:"))
 async def bookings_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     parts = callback.data.split(":", 3)
     # bk:p:PAGE:query
@@ -814,13 +820,18 @@ async def bookings_page(callback: CallbackQuery):
 
 @router.callback_query(F.data == "bk:noop")
 async def bookings_noop(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(
+            "⛔ Только админы могут управлять записями.",
+            show_alert=True,
+        )
+        return
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("bk:bulkpage:"))
 async def bookings_bulk_page_ask(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     parts = callback.data.split(":", 3)
     page = parts[2] if len(parts) > 2 else "0"
@@ -840,8 +851,7 @@ async def bookings_bulk_page_ask(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("bk:bulkall"))
 async def bookings_bulk_all_ask(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     # bk:bulkall: or bk:bulkall:query
     query = callback.data.split(":", 2)[2] if callback.data.count(":") >= 2 else ""
@@ -902,8 +912,7 @@ async def _bulk_cancel(bot: Bot, bookings: list) -> int:
 
 @router.callback_query(F.data.startswith("bk:dobulkpage:"))
 async def bookings_do_bulk_page(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     parts = callback.data.split(":", 3)
@@ -919,8 +928,7 @@ async def bookings_do_bulk_page(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("bk:dobulkall:"))
 async def bookings_do_bulk_all(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
+    if not await require_admin_cb(callback):
         return
     from src.services import settings_store as store
     query = callback.data.split(":", 2)[2] if callback.data.count(":") >= 2 else ""

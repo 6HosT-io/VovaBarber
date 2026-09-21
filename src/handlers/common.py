@@ -16,6 +16,27 @@ router = Router()
 WELCOME_IMAGE = Path("assets/welcome.png")
 ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
 
+def _admin_ids() -> list[int]:
+    ids = []
+    for x in (os.getenv("ADMIN_IDS") or "").split(","):
+        x = x.strip()
+        if x.isdigit():
+            ids.append(int(x))
+    return ids
+
+
+async def _ensure_admin_cb(callback: CallbackQuery) -> bool:
+    """Only ADMIN_IDS may use group admin buttons (confirm / reject / cancel / set name)."""
+    if callback.from_user and callback.from_user.id in _admin_ids():
+        return True
+    await callback.answer(
+        "⛔ Только админы (вы и барбер) могут нажать эту кнопку.",
+        show_alert=True,
+    )
+    return False
+
+
+
 
 class BookingStates(StatesGroup):
     waiting_comment = State()
@@ -805,6 +826,8 @@ async def set_language(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm:ok:"))
 async def admin_confirm(callback: CallbackQuery, bot: Bot):
+    if not await _ensure_admin_cb(callback):
+        return
     client_id = int(callback.data.split(":")[2])
     from src.services import settings_store as store
     from src.services import calendar as gcal
@@ -932,6 +955,8 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("adm:no:"))
 async def admin_reject(callback: CallbackQuery, bot: Bot):
+    if not await _ensure_admin_cb(callback):
+        return
     client_id = int(callback.data.split(":")[2])
     from src.services import settings_store as store
     pending = store.pop_pending_booking(client_id)
@@ -993,6 +1018,8 @@ async def _clear_group_cancel_button(
 @router.callback_query(F.data.startswith("adm:cancel:"))
 async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
     """Barber cancels an already confirmed appointment."""
+    if not await _ensure_admin_cb(callback):
+        return
     booking_id = callback.data.split(":")[2]
     from src.services import settings_store as store
     existing = store.get_booking(booking_id)
@@ -1075,6 +1102,8 @@ async def admin_cancel_booking(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("adm:setname:"))
 async def admin_setname_start(callback: CallbackQuery, state: FSMContext):
     """Admin wants to save how they know this client in phone contacts."""
+    if not await _ensure_admin_cb(callback):
+        return
     client_id = int(callback.data.split(":")[2])
     await state.set_state(BookingStates.waiting_contact_name)
     await state.update_data(name_for_user_id=client_id)
@@ -1089,6 +1118,9 @@ async def admin_setname_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(BookingStates.waiting_contact_name)
 async def admin_setname_save(message: Message, state: FSMContext):
+    if message.from_user.id not in _admin_ids():
+        await state.clear()
+        return
     if message.text and message.text.startswith("/cancel"):
         await state.clear()
         await message.answer("Отменено.")
