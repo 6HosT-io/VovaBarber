@@ -10,6 +10,7 @@ def main_menu_kb(lang: str = "ru") -> ReplyKeyboardMarkup:
         builder.button(text="💰 Цены")
         builder.button(text="📞 Связаться")
         builder.button(text="❌ Отменить запись")
+        builder.button(text="📅 Перенести запись")
         builder.button(text="🌐 Language / Valoda")
     else:
         builder.button(text="📅 Pierakstīties")
@@ -17,8 +18,9 @@ def main_menu_kb(lang: str = "ru") -> ReplyKeyboardMarkup:
         builder.button(text="💰 Cenas")
         builder.button(text="📞 Sazināties")
         builder.button(text="❌ Atcelt pierakstu")
+        builder.button(text="📅 Pārcelt pierakstu")
         builder.button(text="🌐 Language / Valoda")
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
 
