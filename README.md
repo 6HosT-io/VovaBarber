@@ -50,6 +50,22 @@ Shown for each client:
 | 💬 Написать клиенту | Open chat |
 | 📝 Имя в контактах | Save barber’s phone nickname |
 
+**Access control (ADMIN_IDS only)**
+
+All admin actions are restricted to Telegram user IDs listed in `ADMIN_IDS` (you + barber). Non-admins get an alert (buttons) or **no reply** (commands).
+
+| Surface | What is locked |
+|---------|----------------|
+| Group booking card | ✅ Confirm, ❌ Reject, ❌ Cancel booking, 📝 Contact name |
+| Group reschedule card | ✅ Confirm reschedule, ❌ Reject, 📝 Contact name |
+| `/bookings` cards & bulk | Cancel one, cancel page, cancel all, pagination |
+| `/settings` & panel buttons | Prices, hours, welcome, reminders, capacity, blocked days |
+| Commands | `/admin`, `/settings`, `/bookings`, `/block`, `/vacation`, `/stats`, `/cancel_id`, `/test_group`, … |
+
+Telegram still *shows* inline buttons to every group member; the bot **ignores** presses from non-admins. Commands typed by non-admins produce **no response**.
+
+`ADMIN_IDS` example: `1361872676,283788179`
+
 Group Privacy (BotFather): enable so normal chat in the admin group is **not** re-forwarded by the bot. Free-text handler only runs in **private** client chats.
 
 ---
@@ -83,7 +99,8 @@ Cancel is locked in store (threading + file lock). Status is the source of truth
 | `/vacation START END` | **vacation** range | Friendly: on break until **last vacation day**, can book **after** that date |
 | `/unblock` / `/unvacation` / `/unblock_all` | open days again | — |
 
-Legacy days in `blocked_days` without a reason are treated as **block**.
+Vacation is stored both as day tags and as `vacation_ranges` (so the client always gets the “on break until …” text).  
+After deploying this logic, **run `/vacation` again** for the current holiday — older closes may still be tagged only as simple block.
 
 Examples:
 
