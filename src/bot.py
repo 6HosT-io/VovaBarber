@@ -35,6 +35,7 @@ PUBLIC_COMMANDS = [
     BotCommand(command="contact", description="Связаться / Sazināties"),
     BotCommand(command="cancel", description="Отменить шаг / Atcelt"),
     BotCommand(command="cancel_booking", description="Отменить запись / Atcelt pierakstu"),
+    BotCommand(command="reschedule", description="Перенести запись / Pārcelt"),
     BotCommand(command="help", description="Помощь / Palīdzība"),
 ]
 
@@ -49,6 +50,7 @@ ADMIN_EXTRA = [
     BotCommand(command="unblock_all", description="Снять все блоки"),
     BotCommand(command="bookings", description="Активные записи"),
     BotCommand(command="cancel_id", description="Отмена по ID"),
+    BotCommand(command="stats", description="Статистика"),
 ]
 
 
