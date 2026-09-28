@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from loguru import logger
 
-from src.keyboards.client import main_menu_kb, language_kb, day_selection_kb
+from src.keyboards.client import main_menu_kb, language_kb, day_selection_kb, service_selection_kb, slot_selection_kb
 
 router = Router()
 
@@ -39,12 +39,16 @@ async def _ensure_admin_cb(callback: CallbackQuery) -> bool:
 
 
 class BookingStates(StatesGroup):
+    waiting_slot = State()
+    waiting_service = State()
     waiting_comment = State()
     waiting_custom_date = State()
     waiting_contact_name = State()  # admin sets "name in contacts"
     reschedule_date = State()
     reschedule_custom_date = State()
     reschedule_comment = State()
+    admin_suggest = State()  # barber types alternative time after reject
+    admin_edit = State()  # barber edits confirmed booking
 
 
 def get_lang(message: Message) -> str:
@@ -110,6 +114,7 @@ async def cmd_start(message: Message, state: FSMContext):
     try:
         from src.services import settings_store as store
         store.track_event("start", message.from_user.id)
+        store.save_client_username(message.from_user.id, message.from_user.username)
     except Exception:
         pass
     from src.services import settings_store as store
@@ -128,7 +133,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "ru": (
             "Запись к Лучшему Барберу, Парикмахеру и Другу — без звонков и ожидания!\n\n"
             "🗓️ Выберите день (сегодня / завтра / послезавтра)\n"
-            "⌚️ Укажите удобное время\n"
+            "⌚️ Выберите свободное время — бот показывает окна из календаря\n"
             "닦다 Выберите услугу\n"
             "☑️ Получите подтверждение от барбера\n\n"
             "💈 Адрес: Jasmuižas iela 9, Rīga\n"
@@ -141,7 +146,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "lv": (
             "Reģistrējieties pie labākā bārddziņa, friziera un drauga — bez zvaniem un gaidīšanas!\n\n"
             "🗓️ Izvēlieties dienu (šodien / rīt / parīt)\n"
-            "⌚️ Norādiet jums ērtu laiku\n"
+            "⌚️ Izvēlieties brīvo laiku — bots rāda logus no kalendāra\n"
             "💇 Izvēlieties pakalpojumu\n"
             "☑️ Saņemiet apstiprinājumu no bārddziņa\n\n"
             "💈 Adrese: Jasmuižas iela 9, Rīga\n"
@@ -171,11 +176,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 async def _deny_if_closed_or_full(message_or_cb, date_str: str, lang: str, *, as_callback: bool) -> bool:
-    """Return True if day is closed/full and client was notified (stop flow)."""
+    """Return True if day is blocked/vacation (capacity limit disabled)."""
     from src.services import settings_store as store
-    closed = store.is_blocked(date_str)
-    full = (not closed) and store.is_day_full(date_str)
-    if not closed and not full:
+    if not store.is_blocked(date_str):
         return False
     msg = store.client_unavailable_message(date_str, lang)
     if as_callback:
@@ -183,6 +186,38 @@ async def _deny_if_closed_or_full(message_or_cb, date_str: str, lang: str, *, as
         await message_or_cb.answer()
     else:
         await message_or_cb.answer(msg)
+    return True
+
+
+async def _offer_slots(target, state: FSMContext, date_str: str, lang: str, *, edit: bool):
+    """Fetch calendar and show free slots (adjacency-sorted)."""
+    from src.services import calendar as gcal
+    slots = gcal.get_available_slots(date_str)
+    if not slots:
+        text = (
+            f"На <b>{date_str}</b> свободных окон нет (календарь занят или вне рабочих часов).\n"
+            f"Выберите другой день."
+            if lang == "ru"
+            else f"<b>{date_str}</b> — nav brīvu laiku.\nIzvēlieties citu dienu."
+        )
+        if edit:
+            await target.edit_text(text, reply_markup=day_selection_kb(lang))
+        else:
+            await target.answer(text, reply_markup=day_selection_kb(lang))
+        return False
+    await state.update_data(date=date_str, slot=None)
+    await state.set_state(BookingStates.waiting_slot)
+    text = (
+        f"Дата: <b>{date_str}</b>\nВыберите свободное время\n"
+        f"<i>Сначала окна рядом с уже стоящими клиентами</i>"
+        if lang == "ru"
+        else f"Datums: <b>{date_str}</b>\nIzvēlieties brīvo laiku"
+    )
+    markup = slot_selection_kb(slots, lang)
+    if edit:
+        await target.edit_text(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
     return True
 
 # ---------- Book ----------
@@ -197,7 +232,7 @@ async def cmd_book(message: Message, state: FSMContext):
 
 
 async def _apply_reschedule_day(callback: CallbackQuery, state: FSMContext, day_key: str):
-    """Shared logic when client picks a new day while rescheduling."""
+    """Reschedule: pick day then same calendar slots as /book."""
     lang_code = (callback.from_user.language_code or "ru").lower()
     lang = "lv" if lang_code.startswith("lv") else "ru"
     from src.services import settings_store as store
@@ -212,20 +247,17 @@ async def _apply_reschedule_day(callback: CallbackQuery, state: FSMContext, day_
         return
 
     date_str = resolve_date(day_key)
-    if store.is_blocked(date_str) or store.is_day_full(date_str):
-        msg = store.client_unavailable_message(date_str, lang)
-        await callback.message.edit_text(msg)
+    if store.is_blocked(date_str):
+        await callback.message.edit_text(store.client_unavailable_message(date_str, lang))
         await callback.answer()
         return
-    await state.update_data(reschedule_date=date_str, reschedule_day_key=day_key)
-    await state.set_state(BookingStates.reschedule_comment)
-    await callback.message.edit_text(
-        f"Новая дата: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
-        f"Напишите время или комментарий:"
-        if lang == "ru"
-        else f"Jaunais datums: <b>{day_label(day_key, lang)}</b> ({date_str})\n\n"
-        f"Uzrakstiet laiku vai komentāru:"
+    await state.update_data(
+        reschedule_date=date_str,
+        reschedule_day_key=day_key,
+        date=date_str,
+        day_key=day_key,
     )
+    await _offer_slots(callback.message, state, date_str, lang, edit=True)
     await callback.answer()
 
 
@@ -266,19 +298,7 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(day_key=day_key, date=date_str)
-    await state.set_state(BookingStates.waiting_comment)
-
-    name = day_label(day_key, lang)
-    text_msg = (
-        f"Вы выбрали: <b>{name}</b> ({date_str})\n\n"
-        "Напишите желаемое время или комментарий\n"
-        "(например: «после 16:00, мужская стрижка» или «около 11»)."
-        if lang == "ru"
-        else f"Jūs izvēlējāties: <b>{name}</b> ({date_str})\n\n"
-        "Uzrakstiet vēlamo laiku vai komentāru\n"
-        "(piemēram: «pēc 16:00, vīriešu griezums»)."
-    )
-    await callback.message.edit_text(text_msg)
+    await _offer_slots(callback.message, state, date_str, lang, edit=True)
     await callback.answer()
 
 
@@ -302,17 +322,103 @@ async def process_custom_date(message: Message, state: FSMContext):
         return
 
     await state.update_data(day_key="other", date=date_str)
-    await state.set_state(BookingStates.waiting_comment)
+    await _offer_slots(message, state, date_str, lang, edit=False)
 
-    text_msg = (
-        f"Дата: <b>{date_str}</b>\n\n"
-        "Напишите желаемое время или комментарий\n"
-        "(например: «после 16:00, мужская стрижка»)."
-        if lang == "ru"
-        else f"Datums: <b>{date_str}</b>\n\n"
-        "Uzrakstiet vēlamo laiku vai komentāru."
-    )
-    await message.answer(text_msg)
+
+
+
+
+@router.callback_query(BookingStates.waiting_slot, F.data.startswith("slot:"))
+async def process_slot(callback: CallbackQuery, state: FSMContext):
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+    key = callback.data.split(":", 1)[1]
+    data0 = await state.get_data()
+    is_reschedule = bool(data0.get("reschedule_id"))
+
+    if key == "back":
+        if is_reschedule:
+            await state.set_state(BookingStates.reschedule_date)
+        else:
+            await state.set_state(None)
+        await callback.message.edit_text(
+            "Выберите день:" if lang == "ru" else "Izvēlieties dienu:",
+            reply_markup=day_selection_kb(lang),
+        )
+        await callback.answer()
+        return
+
+    slot = key
+    data = await state.get_data()
+    date_str = data.get("date") or data.get("reschedule_date") or ""
+    from src.services import calendar as gcal
+    free = gcal.get_available_slots(date_str, use_cache=False)
+    if slot not in free:
+        await callback.answer(
+            "Это время уже занято, выберите другое" if lang == "ru" else "Laiks aizņemts",
+            show_alert=True,
+        )
+        await _offer_slots(callback.message, state, date_str, lang, edit=True)
+        return
+
+    await state.update_data(slot=slot)
+    if is_reschedule:
+        await state.update_data(reschedule_date=date_str)
+        await state.set_state(BookingStates.reschedule_comment)
+        nl = chr(10)
+        if lang == "ru":
+            msg = "Перенос на <b>%s</b> · <b>%s</b>%s%sКомментарий (или «-»):" % (date_str, slot, nl, nl)
+        else:
+            msg = "Pārcelšana: <b>%s</b> · <b>%s</b>%s%sKomentārs (vai «-»):" % (date_str, slot, nl, nl)
+        await callback.message.edit_text(msg)
+        await callback.answer()
+        return
+
+    await state.set_state(BookingStates.waiting_service)
+    nl = chr(10)
+    if lang == "ru":
+        text_msg = "Дата: <b>%s</b> · время: <b>%s</b>%s%sВыберите услугу:" % (date_str, slot, nl, nl)
+    else:
+        text_msg = "Datums: <b>%s</b> · laiks: <b>%s</b>%s%sIzvēlieties pakalpojumu:" % (date_str, slot, nl, nl)
+    await callback.message.edit_text(text_msg, reply_markup=service_selection_kb(lang))
+    await callback.answer()
+
+
+@router.callback_query(BookingStates.waiting_service, F.data.startswith("svc:"))
+async def process_service(callback: CallbackQuery, state: FSMContext):
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+    from src.services import settings_store as store
+    sid = callback.data.split(":", 1)[1]
+    service_name = ""
+    service_id = ""
+    if sid != "skip":
+        svc = store.get_service_by_id(sid)
+        if svc:
+            service_id = sid
+            service_name = svc.get("name_ru") if lang == "ru" else svc.get("name_lv")
+            service_name = service_name or sid
+    await state.update_data(service_id=service_id, service_name=service_name or "")
+    await state.set_state(BookingStates.waiting_comment)
+    data = await state.get_data()
+    date_str = data.get("date", "")
+    slot = data.get("slot") or ""
+    parts = []
+    if service_name:
+        parts.append(
+            ("Услуга: <b>%s</b>" if lang == "ru" else "Pakalpojums: <b>%s</b>") % service_name
+        )
+    if lang == "ru":
+        parts.append("Дата: <b>%s</b> · <b>%s</b>" % (date_str, slot))
+        parts.append("")
+        parts.append("Комментарий для барбера (или «-»).")
+        parts.append("Время уже выбрано слотом.")
+    else:
+        parts.append("Datums: <b>%s</b> · <b>%s</b>" % (date_str, slot))
+        parts.append("")
+        parts.append("Komentārs barberam (vai «-»).")
+    await callback.message.edit_text(chr(10).join(parts))
+    await callback.answer()
 
 
 @router.message(BookingStates.waiting_comment)
@@ -320,70 +426,90 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     day_key = data.get("day_key", "—")
     date_str = data.get("date", "—")
-    comment = message.text or "—"
+    slot = data.get("slot") or ""
+    raw = (message.text or "").strip() or "—"
+    # Slot is source of truth for time; keep client note separate
+    if slot:
+        comment = f"{slot}" + (f" · {raw}" if raw not in ("—", "-", "") else "")
+    else:
+        comment = raw
+    service_id = data.get("service_id") or ""
+    service_name = data.get("service_name") or ""
     lang = get_lang(message)
+    from src.services import settings_store as store
+
+    # re-check capacity at submit
+    if store.is_blocked(date_str):
+        await state.clear()
+        await message.answer(store.client_unavailable_message(date_str, lang), reply_markup=main_menu_kb(lang))
+        return
 
     await state.clear()
-
-    # Confirm to client
+    extracted = slot or store.extract_time_hint(comment)
     day_name = day_label(day_key, lang)
+    svc_line = f"\nУслуга: <b>{service_name}</b>" if service_name else ""
+    time_line = f"\nВремя: <b>{extracted}</b>" if extracted else ""
     client_text = (
         f"✅ Заявка отправлена!\n\n"
-        f"День: <b>{day_name}</b> ({date_str})\n"
+        f"День: <b>{day_name}</b> ({date_str}){svc_line}{time_line}\n"
         f"Комментарий: {comment}\n\n"
         f"Барбер скоро подтвердит или предложит другое время."
         if lang == "ru"
         else f"✅ Pieprasījums nosūtīts!\n\n"
         f"Diena: <b>{day_name}</b> ({date_str})\n"
-        f"Komentārs: {comment}\n\n"
-        f"Frizieris drīz apstiprinās vai piedāvās citu laiku."
+        f"Komentārs: {comment}"
     )
     await message.answer(client_text, reply_markup=main_menu_kb(lang))
 
-    # Structured notification to admin group
     if ADMIN_GROUP_ID:
         user = message.from_user
-        from src.services import settings_store as store
         client_line = store.format_client_line(user.id, user.full_name, ref_date=date_str)
         group_text = (
             f"🆕 <b>Новая заявка</b>\n\n"
             f"{client_line}\n"
             f"📅 День: <b>{day_label(day_key, 'ru')}</b> ({date_str})\n"
-            f"💬 Комментарий: {comment}"
         )
+        if service_name:
+            group_text += f"✂️ Услуга: <b>{service_name}</b>\n"
+        if extracted:
+            group_text += f"🕐 Время: <b>{extracted}</b>\n"
+        group_text += f"💬 Комментарий: {comment}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:ok:{user.id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{user.id}"),
             ],
             [
-                InlineKeyboardButton(text="💬 Написать клиенту", url=f"tg://user?id={user.id}"),
-            ],
-            [
+                InlineKeyboardButton(text="💬 Написать клиенту", url=store.client_chat_url(user.id, user.username)),
                 InlineKeyboardButton(text="📝 Имя в контактах", callback_data=f"adm:setname:{user.id}"),
             ],
         ])
         try:
+            store.save_client_username(user.id, user.username)
             store.save_pending_booking(
                 user.id,
                 date_str,
                 comment,
                 client_name=user.full_name or "",
                 kind="book",
+                service_id=service_id,
+                service_name=service_name,
+                extracted_time=extracted,
             )
             store.track_event("book_request", user.id)
             await bot.send_message(ADMIN_GROUP_ID, group_text, reply_markup=kb)
+            notice = store.maybe_notify_day_almost_full(date_str)
+            if notice:
+                await bot.send_message(ADMIN_GROUP_ID, notice)
             logger.info(f"Booking request from {user.id} sent to group")
         except Exception as e:
             logger.error(f"Failed to send booking to group: {e}")
             await message.answer(
-                "Заявка принята, но не удалось уведомить барбера. "
-                "Напишите, пожалуйста, ещё раз чуть позже." if lang == "ru"
-                else "Pieprasījums pieņemts, bet neizdevās paziņot frizierim."
+                "Заявка принята, но не удалось уведомить барбера." if lang == "ru"
+                else "Pieprasījums pieņemts, bet neizdevās paziņot."
             )
 
 
-# ---------- Cancel ----------
 
 @router.message(Command("cancel"))
 @router.message(F.text.lower().in_({"отменить", "отмена", "cancel", "atcelt"}))
@@ -596,14 +722,16 @@ async def reschedule_custom_date(message: Message, state: FSMContext):
         await message.answer("Формат: <b>ДД/ММ/ГГГГ</b>")
         return
     date_str = to_display(parsed)
-    if store.is_blocked(date_str) or store.is_day_full(date_str):
+    if store.is_blocked(date_str):
         await message.answer(store.client_unavailable_message(date_str, lang))
         return
-    await state.update_data(reschedule_date=date_str, reschedule_day_key="other")
-    await state.set_state(BookingStates.reschedule_comment)
-    await message.answer(
-        f"Новая дата: <b>{date_str}</b>\n\nНапишите время или комментарий:"
+    await state.update_data(
+        reschedule_date=date_str,
+        reschedule_day_key="other",
+        date=date_str,
+        day_key="other",
     )
+    await _offer_slots(message, state, date_str, lang, edit=False)
 
 
 @router.message(BookingStates.reschedule_comment)
@@ -614,7 +742,12 @@ async def reschedule_comment(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     booking_id = data.get("reschedule_id")
     new_date = data.get("reschedule_date")
-    comment = (message.text or "").strip() or "—"
+    slot = data.get("slot") or ""
+    raw = (message.text or "").strip() or "—"
+    if slot:
+        comment = f"{slot}" + (f" · {raw}" if raw not in ("—", "-", "") else "")
+    else:
+        comment = raw
     await state.clear()
     if not booking_id or not new_date:
         await message.answer("Сессия сброшена. Начните снова: /reschedule")
@@ -628,12 +761,14 @@ async def reschedule_comment(message: Message, state: FSMContext, bot: Bot):
         return
     old_date = existing.get("date", "—")
     user = message.from_user
+    store.save_client_username(user.id, user.username)
     store.save_pending_booking(
         user.id,
         new_date,
         comment,
         client_name=user.full_name or "",
-        kind="reschedule",
+        kind="reschedule",  # noqa
+
         reschedule_id=booking_id,
         old_date=old_date,
     )
@@ -665,7 +800,7 @@ async def reschedule_comment(message: Message, state: FSMContext, bot: Bot):
                     InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{user.id}"),
                 ],
                 [
-                    InlineKeyboardButton(text="💬 Написать клиенту", url=f"tg://user?id={user.id}"),
+                    InlineKeyboardButton(text="💬 Написать клиенту", url=store.client_chat_url(user.id, user.username)),
                 ],
                 [
                     InlineKeyboardButton(text="📝 Имя в контактах", callback_data=f"adm:setname:{user.id}"),
@@ -857,7 +992,7 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
         store.track_event("reschedule_confirmed", client_id)
         name = pending.get("client_name") or "Клиент"
         contact = store.get_client_contact_name(client_id)
-        summary = f"Barbershop: {contact or name} (перенос)"
+        summary = f"{contact or name} (перенос)"
         desc = (
             f"Telegram: {name}\n"
             f"Комментарий: {pending.get('comment', '')}\n"
@@ -867,7 +1002,7 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             summary=summary,
             date_str=pending.get("date", ""),
             comment=pending.get("comment", ""),
-            duration_min=45,
+            duration_min=60,
             description=desc,
         )
         if event_id:
@@ -891,7 +1026,8 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
         store.track_event("booking_confirmed", client_id)
         name = pending.get("client_name") or "Клиент"
         contact = store.get_client_contact_name(client_id)
-        summary = f"Barbershop: {contact or name}"
+        svc = pending.get("service_name") or ""
+        summary = f"{contact or name}" + (f" — {svc}" if svc else "")
         desc = (
             f"Telegram: {name}\n"
             f"Комментарий: {pending.get('comment', '')}\n"
@@ -901,7 +1037,7 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             summary=summary,
             date_str=pending.get("date", ""),
             comment=pending.get("comment", ""),
-            duration_min=45,
+            duration_min=60,
             description=desc,
         )
         if event_id:
@@ -970,18 +1106,70 @@ async def admin_reject(callback: CallbackQuery, bot: Bot):
                 "Можно предложить другой слот через /reschedule или /book.",
             )
             footer = "\n\n❌ <b>Перенос отклонён</b> (старая запись сохранена)"
+            await callback.message.edit_text(callback.message.text + footer)
         else:
             await bot.send_message(
                 client_id,
                 "К сожалению, эту заявку сейчас не можем принять. "
-                "Напишите, пожалуйста, другое время через /book.",
+                "Напишите другое время через /book — или дождитесь предложения от барбера.",
             )
             footer = "\n\n❌ <b>Отклонено</b>"
-        await callback.message.edit_text(callback.message.text + footer)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="📅 Предложить другое время",
+                    callback_data=f"adm:suggest:{client_id}",
+                )],
+            ])
+            await callback.message.edit_text(callback.message.text + footer, reply_markup=kb)
     except Exception as e:
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
     await callback.answer("Клиент уведомлён")
+
+
+@router.callback_query(F.data.startswith("adm:suggest:"))
+async def admin_suggest_start(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_admin_cb(callback):
+        return
+    client_id = int(callback.data.split(":")[2])
+    await state.set_state(BookingStates.admin_suggest)
+    await state.update_data(suggest_user_id=client_id)
+    await callback.message.answer(
+        "Напишите клиенту предложение (время/день) одним сообщением.\n"
+        "Пример: «Могу завтра после 15:00 или в пятницу утром»\n"
+        "/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(BookingStates.admin_suggest)
+async def admin_suggest_send(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id not in _admin_ids():
+        await state.clear()
+        return
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    uid = data.get("suggest_user_id")
+    await state.clear()
+    if not uid:
+        await message.answer("Сессия сброшена.")
+        return
+    text_out = (message.text or "").strip()
+    if not text_out:
+        await message.answer("Пустое сообщение.")
+        return
+    try:
+        await bot.send_message(
+            int(uid),
+            f"✂️ Сообщение от барбера:\n\n{text_out}\n\n"
+            f"Записаться: /book",
+        )
+        await message.answer("✅ Отправлено клиенту.")
+    except Exception as e:
+        await message.answer(f"Не удалось отправить: {e}")
 
 
 
@@ -1207,9 +1395,12 @@ async def forward_free_text(message: Message, bot: Bot, state: FSMContext):
     # Skip if we are inside booking flow
     current = await state.get_state()
     if current in (
+        BookingStates.waiting_service.state,
         BookingStates.waiting_comment.state,
         BookingStates.waiting_custom_date.state,
         BookingStates.waiting_contact_name.state,
+        BookingStates.admin_suggest.state,
+        BookingStates.admin_edit.state,
         BookingStates.reschedule_date.state,
         BookingStates.reschedule_custom_date.state,
         BookingStates.reschedule_comment.state,
@@ -1239,7 +1430,7 @@ async def forward_free_text(message: Message, bot: Bot, state: FSMContext):
         from src.services import settings_store as store
         client_line = store.format_client_line(user.id, user.full_name)
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Написать клиенту", url=f"tg://user?id={user.id}")],
+            [InlineKeyboardButton(text="💬 Написать клиенту", url=store.client_chat_url(user.id, getattr(user, "username", None)))],
             [InlineKeyboardButton(text="📝 Имя в контактах", callback_data=f"adm:setname:{user.id}")],
         ])
         await bot.send_message(

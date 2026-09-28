@@ -13,6 +13,10 @@ router = Router()
 # Blocked days are persisted via settings_store
 
 
+class EditStates(StatesGroup):
+    waiting_edit = State()
+
+
 class SettingsStates(StatesGroup):
     edit_capacity = State()
     edit_location = State()
@@ -39,6 +43,13 @@ def get_admin_group() -> str | None:
 
 def is_admin(user_id: int) -> bool:
     return user_id in get_admin_ids()
+
+
+async def require_admin_msg(message: Message) -> bool:
+    """Private admin commands: only ADMIN_IDS. Silent for others."""
+    if message.from_user and is_admin(message.from_user.id):
+        return True
+    return False
 
 
 async def require_admin_cb(callback: CallbackQuery) -> bool:
@@ -202,6 +213,23 @@ async def cmd_test_group(message: Message):
 
 
 # ---------- Settings callbacks (need settings_store) ----------
+
+
+@router.message(Command("test_calendar", "testcalendar", "gcal"))
+async def cmd_test_calendar(message: Message):
+    """Diagnose Google Calendar + optional write test."""
+    if not await require_admin_msg(message):
+        return
+    from src.services import calendar as gcal
+    report = gcal.diagnose()
+    # write test only if read looks OK
+    if "OK: API can read" in report:
+        report += "\n\n" + gcal.test_write_event()
+    # Telegram message limit
+    if len(report) > 3500:
+        report = report[:3500] + "\n…"
+    await message.answer(f"<b>Google Calendar</b>\n<pre>{report}</pre>", parse_mode="HTML")
+
 
 @router.callback_query(F.data == "set:show")
 async def settings_show(callback: CallbackQuery):
@@ -785,7 +813,7 @@ async def _send_bookings_page(target, page: int = 0, query: str = ""):
             )],
             [InlineKeyboardButton(
                 text="💬 Написать клиенту",
-                url=f"tg://user?id={uid}",
+                url=store.client_chat_url(uid),
             )],
         ])
         # always send cards as new messages (hard to edit many)
@@ -803,6 +831,11 @@ async def cmd_bookings(message: Message):
         return
     parts = (message.text or "").split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
+    from src.services import settings_store as store
+    try:
+        await message.answer("📊 Загрузка:\n" + store.format_near_days_load())
+    except Exception:
+        pass
     await _send_bookings_page(message, page=0, query=query)
 
 
@@ -989,3 +1022,134 @@ async def cmd_stats(message: Message):
         return
     from src.services import settings_store as store
     await message.answer(store.get_stats_summary())
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    store.archive_past_bookings()
+    await message.answer(store.week_overview())
+
+
+@router.message(Command("pending"))
+async def cmd_pending(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    import time
+    items = store.list_pending_bookings()
+    if not items:
+        await message.answer("⏳ Нет заявок, ожидающих ответа.")
+        return
+    lines = [f"⏳ <b>Ожидают ответа: {len(items)}</b>", ""]
+    now = time.time()
+    for p in items:
+        uid = p.get("user_id")
+        age_h = ""
+        if p.get("created_at"):
+            age_h = f" · {int((now - float(p['created_at'])) / 3600)}ч назад"
+        line = store.format_client_line(int(uid), p.get("client_name"), ref_date=p.get("date") or "")
+        lines.append(
+            f"{line}\n"
+            f"📅 {p.get('date')} · {p.get('service_name') or '—'} · {p.get('extracted_time') or ''}\n"
+            f"💬 {p.get('comment')}{age_h}\n"
+            f"kind={p.get('kind', 'book')}"
+        )
+        lines.append("")
+    await message.answer("\n".join(lines)[:4000])
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    path = store.backup_runtime()
+    if path:
+        await message.answer(f"✅ Бэкап: <code>{path}</code>")
+    else:
+        await message.answer("Нечего копировать (нет runtime_settings.yaml).")
+
+
+@router.message(Command("edit_id"))
+async def cmd_edit_id(message: Message, state: FSMContext):
+    """Edit confirmed booking: /edit_id ID"""
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Синтаксис: <code>/edit_id ID</code>\n"
+            "ID видно в /bookings.\n"
+            "Затем пришлите: <code>ДД/ММ/ГГГГ | комментарий</code>"
+        )
+        return
+    from src.services import settings_store as store
+    bid = parts[1].strip()
+    b = store.get_booking(bid)
+    if not b or b.get("status") != "confirmed":
+        await message.answer("Запись не найдена или уже не активна.")
+        return
+    await state.set_state(EditStates.waiting_edit)
+    await state.update_data(edit_booking_id=bid)
+    await message.answer(
+        f"Редактирование записи <code>{bid}</code>\n"
+        f"Сейчас: {b.get('date')} · {b.get('comment')}\n\n"
+        f"Пришлите: <code>ДД/ММ/ГГГГ | новый комментарий</code>\n"
+        f"/cancel — отмена"
+    )
+
+
+@router.message(EditStates.waiting_edit)
+async def admin_edit_save(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    bid = data.get("edit_booking_id")
+    await state.clear()
+    if not bid:
+        await message.answer("Сессия сброшена.")
+        return
+    raw = (message.text or "").strip()
+    if "|" in raw:
+        date_part, comment = raw.split("|", 1)
+    else:
+        parts = raw.split(maxsplit=1)
+        date_part = parts[0]
+        comment = parts[1] if len(parts) > 1 else ""
+    date_part = date_part.strip()
+    comment = comment.strip() or "—"
+    d, err = validate_single_date(date_part)
+    if err:
+        await message.answer(err)
+        return
+    from src.services import settings_store as store
+    new_date = to_display(d)
+    b = store.get_booking(bid)
+    if not b or b.get("status") != "confirmed":
+        await message.answer("Запись больше не активна.")
+        return
+    store.update_booking(
+        bid,
+        date=new_date,
+        comment=comment,
+        reminder_24h_sent=False,
+        reminder_morning_sent=False,
+        client_confirmed=False,
+        client_thinking=False,
+    )
+    try:
+        await bot.send_message(
+            int(b["user_id"]),
+            f"✂️ Барбер обновил вашу запись:\n"
+            f"📅 <b>{new_date}</b>\n💬 {comment}",
+        )
+    except Exception:
+        pass
+    await message.answer(f"✅ Обновлено: {new_date} · {comment}")
