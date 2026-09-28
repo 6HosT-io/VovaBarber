@@ -51,6 +51,10 @@ ADMIN_EXTRA = [
     BotCommand(command="bookings", description="Активные записи"),
     BotCommand(command="cancel_id", description="Отмена по ID"),
     BotCommand(command="stats", description="Статистика"),
+    BotCommand(command="edit_id", description="Править запись"),
+    BotCommand(command="backup", description="Бэкап настроек"),
+    BotCommand(command="pending", description="Очередь заявок"),
+    BotCommand(command="week", description="Неделя / загрузка"),
 ]
 
 
@@ -100,6 +104,12 @@ async def on_startup():
 
 async def main():
     register_handlers()
+    try:
+        from src.services import settings_store as store
+        store.archive_past_bookings()
+        store.backup_runtime()
+    except Exception as e:
+        logger.warning(f'startup archive/backup: {e}')
     dp.startup.register(on_startup)
     logger.info("Starting bot with Long Polling...")
     await dp.start_polling(bot)
