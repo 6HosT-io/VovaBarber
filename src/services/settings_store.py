@@ -246,6 +246,35 @@ def save_client_contact_name(telegram_id: int, name: str):
     save_runtime(runtime)
 
 
+def save_client_username(telegram_id: int, username: str | None):
+    """Store @username when client talks to the bot (for open-chat links)."""
+    if not username:
+        return
+    runtime = get_runtime()
+    names = runtime.get("client_usernames", {}) or {}
+    names[str(telegram_id)] = username.lstrip("@").strip()
+    runtime["client_usernames"] = names
+    save_runtime(runtime)
+
+
+def get_client_username(telegram_id: int) -> str | None:
+    runtime = get_runtime()
+    names = runtime.get("client_usernames", {}) or {}
+    u = names.get(str(telegram_id))
+    return u or None
+
+
+def client_chat_url(telegram_id: int, username: str | None = None) -> str:
+    """
+    Prefer https://t.me/username — opens the chat in most clients.
+    Fallback: tg://user?id=... (profile / chat depending on client).
+    """
+    u = (username or "").lstrip("@").strip() or get_client_username(telegram_id)
+    if u:
+        return f"https://t.me/{u}"
+    return f"tg://user?id={telegram_id}"
+
+
 def format_client_line(telegram_id: int, tg_full_name, ref_date: str = "") -> str:
     """Line for group messages: Telegram name + contact + one relevant past visit."""
     tg = tg_full_name or "Клиент"
@@ -501,7 +530,8 @@ def count_demand_for_date(date_str: str) -> int:
 
 
 def is_day_full(date_str: str) -> bool:
-    return count_demand_for_date(date_str) >= get_max_bookings_per_day()
+    # Capacity limit disabled — Google Calendar slots control availability
+    return False
 
 
 def client_unavailable_message(date_str: str, lang: str = "ru") -> str:
@@ -559,7 +589,11 @@ def save_pending_booking(
     kind: str = "book",
     reschedule_id: str = "",
     old_date: str = "",
+    service_id: str = "",
+    service_name: str = "",
+    extracted_time: str = "",
 ):
+    import time as _time
     runtime = get_runtime()
     pending = runtime.get("pending_bookings", {}) or {}
     pending[str(user_id)] = {
@@ -569,6 +603,10 @@ def save_pending_booking(
         "kind": kind or "book",
         "reschedule_id": reschedule_id or "",
         "old_date": old_date or "",
+        "service_id": service_id or "",
+        "service_name": service_name or "",
+        "extracted_time": extracted_time or "",
+        "created_at": _time.time(),
     }
     runtime["pending_bookings"] = pending
     save_runtime(runtime)
@@ -913,7 +951,11 @@ def get_booking(booking_id: str) -> dict | None:
 
 
 def get_all_active_bookings() -> list:
-    """All confirmed (not cancelled) bookings, newest last."""
+    """All confirmed (not cancelled/completed) bookings. Archives past dates first."""
+    try:
+        archive_past_bookings()
+    except Exception:
+        pass
     return [b for b in get_confirmed_bookings() if b.get("status") == "confirmed"]
 
 
@@ -937,6 +979,167 @@ def find_active_bookings(query: str) -> list:
 
 
 # ---------- Simple analytics ----------
+
+
+
+# ---------- Load / capacity display ----------
+
+def format_day_load(date_str: str) -> str:
+    n = count_demand_for_date(date_str)
+    lim = get_max_bookings_per_day()
+    return f"{n}/{lim}"
+
+
+def format_near_days_load() -> str:
+    """Today / tomorrow / day-after load lines (RU)."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    lines = []
+    labels = ["Сегодня", "Завтра", "Послезавтра"]
+    for i, lab in enumerate(labels):
+        d = (today + timedelta(days=i)).strftime("%d/%m/%Y")
+        if is_blocked(d):
+            reason = get_day_close_reason(d) or "block"
+            tag = "🏖 отпуск" if reason == "vacation" else "🔒 блок"
+            lines.append(f"• {lab} ({d}): {tag}")
+        else:
+            lines.append(f"• {lab} ({d}): {format_day_load(d)}")
+    return "\n".join(lines)
+
+
+def maybe_notify_day_almost_full(date_str: str) -> str | None:
+    """
+    If load >= 80% of limit, return a one-shot group notice text.
+    Tracks notified dates in runtime so we don't spam.
+    """
+    lim = get_max_bookings_per_day()
+    n = count_demand_for_date(date_str)
+    if lim <= 0 or n < max(1, int(lim * 0.8)):
+        return None
+    runtime = get_runtime()
+    notified = set(runtime.get("capacity_notified_days", []) or [])
+    key = f"{date_str}:{n}"
+    # notify once per date when crossing thresholds 80% and 100%
+    flag_key = f"{date_str}:{'full' if n >= lim else 'warn'}"
+    if flag_key in notified:
+        return None
+    notified.add(flag_key)
+    # keep list short
+    runtime["capacity_notified_days"] = list(notified)[-100:]
+    save_runtime(runtime)
+    if n >= lim:
+        return f"⚠️ <b>День заполнен:</b> {date_str} — {n}/{lim} заявок"
+    return f"⚠️ <b>День почти полный:</b> {date_str} — {n}/{lim} заявок"
+
+
+# ---------- Time extraction from free text ----------
+
+def extract_time_hint(text: str) -> str:
+    """Pull HH:MM or 'после N' / 'около N' from client comment."""
+    import re
+    t = text or ""
+    m = re.search(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b", t)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    m = re.search(r"(?:после|после\s+|pēc|ap)\s*([01]?\d|2[0-3])\b", t, re.I)
+    if m:
+        return f"после {int(m.group(1)):02d}:00"
+    m = re.search(r"(?:около|~)\s*([01]?\d|2[0-3])\b", t, re.I)
+    if m:
+        return f"около {int(m.group(1)):02d}:00"
+    return ""
+
+
+def get_service_by_id(service_id: str) -> dict | None:
+    for s in get_services():
+        if s.get("id") == service_id:
+            return s
+    return None
+
+
+# ---------- Archive past confirmed bookings ----------
+
+def archive_past_bookings() -> int:
+    """Mark confirmed bookings with date before today as status=completed. Returns count."""
+    from datetime import datetime
+    today = datetime.now().date()
+    runtime = get_runtime()
+    bookings = runtime.get("confirmed_bookings", []) or []
+    n = 0
+    for b in bookings:
+        if b.get("status") != "confirmed":
+            continue
+        d = _parse_ddmmyyyy(b.get("date") or "")
+        if d and d < today:
+            b["status"] = "completed"
+            n += 1
+    if n:
+        runtime["confirmed_bookings"] = bookings
+        save_runtime(runtime)
+    return n
+
+
+def list_pending_bookings() -> list:
+    """All pending requests with user_id attached."""
+    runtime = get_runtime()
+    pending = runtime.get("pending_bookings", {}) or {}
+    out = []
+    for uid, p in pending.items():
+        if isinstance(p, dict):
+            item = dict(p)
+            item["user_id"] = uid
+            out.append(item)
+    out.sort(key=lambda x: x.get("created_at") or 0)
+    return out
+
+
+def week_overview() -> str:
+    """Mon–Sun load for current week (RU)."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    monday = today - timedelta(days=today.weekday())
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    lim = get_max_bookings_per_day()
+    lines = [f"📅 <b>Неделя</b> (лимит {lim}/день)", ""]
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        key = d.strftime("%d/%m/%Y")
+        mark = " ← сегодня" if d == today else ""
+        if is_blocked(key):
+            reason = get_day_close_reason(key) or "block"
+            tag = "отпуск" if reason == "vacation" else "блок"
+            lines.append(f"{names[i]} {key}: {tag}{mark}")
+        else:
+            lines.append(f"{names[i]} {key}: {format_day_load(key)}{mark}")
+    pending_n = len(list_pending_bookings())
+    lines.append("")
+    lines.append(f"⏳ Ожидают ответа: <b>{pending_n}</b>")
+    active = len(get_all_active_bookings())
+    lines.append(f"✅ Активных записей: <b>{active}</b>")
+    return "\n".join(lines)
+
+
+def backup_runtime(dest_dir: str = "data/backups") -> str:
+    """Copy runtime_settings.yaml to timestamped backup. Returns path."""
+    from datetime import datetime
+    from shutil import copy2
+    base = Path(dest_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    if not RUNTIME_FILE.exists():
+        return ""
+    name = f"runtime_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml"
+    dest = base / name
+    copy2(RUNTIME_FILE, dest)
+    # keep last 30
+    files = sorted(base.glob("runtime_*.yaml"))
+    for old in files[:-30]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    return str(dest)
+
+
 
 def track_event(event: str, user_id: int | None = None):
     """Increment counters for funnel stats."""
@@ -971,18 +1174,24 @@ def get_stats_summary() -> str:
         return int(stats.get("total_" + event, 0))
     def u(event):
         return len(stats.get("users_" + event, []) or [])
+    conf = n("booking_confirmed")
+    books = n("book_request")
+    conv = f"{(100 * conf // books)}%" if books else "—"
     lines = [
         "📊 <b>Статистика бота</b>",
         "",
         f"▶️ /start: <b>{n('start')}</b> (уник. {u('start')})",
-        f"📝 Заявки: <b>{n('book_request')}</b> (уник. {u('book_request')})",
-        f"✅ Подтверждено: <b>{n('booking_confirmed')}</b>",
+        f"📝 Заявки: <b>{books}</b> (уник. {u('book_request')})",
+        f"✅ Подтверждено: <b>{conf}</b> (конверсия {conv})",
         f"📅 Запросы переноса: <b>{n('reschedule_request')}</b>",
         f"✅ Переносы приняты: <b>{n('reschedule_confirmed')}</b>",
         f"❌ Отмены клиент: <b>{n('cancel_client')}</b>",
         f"❌ Отмены барбер: <b>{n('cancel_barber')}</b>",
         "",
-        f"Активных записей сейчас: <b>{len(get_all_active_bookings())}</b>",
+        f"Активных записей: <b>{len(get_all_active_bookings())}</b>",
+        f"Ожидают ответа: <b>{len(list_pending_bookings())}</b>",
+        "",
+        format_near_days_load(),
     ]
     daily = stats.get("daily", {}) or {}
     if daily:
