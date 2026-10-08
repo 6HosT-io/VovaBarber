@@ -136,26 +136,26 @@ def get_welcome_text(lang: str = "ru") -> str:
         return (
             "Reģistrējieties pie labākā bārddziņa, friziera un drauga — bez zvaniem un gaidīšanas!\n\n"
             "🗓️ Izvēlieties dienu (šodien / rīt / parīt)\n"
-            "⌚️ Norādiet jums ērtu laiku\n"
+            "⌚️ Izvēlieties brīvo laiku — bots rāda logus no kalendāra\n"
             "💇 Izvēlieties pakalpojumu\n"
             "☑️ Saņemiet apstiprinājumu no bārddziņa\n\n"
             "💈 Adrese: Jasmuižas iela 9, Rīga\n"
             "Valodas: krievu un latviešu\n\n"
             "Vienkārši nospiediet Start un izvēlieties to, kas jums ir aktuāli.\n\n"
-            "Svarīgi: bots nosūta atgādinājumus 24 stundas pirms rezervācijas un tajā pašā dienā. "
-            "Ja apstiprināsiet pirmo reizi, tajā pašā rītā atgādinājums netiks nosūtīts."
+            "Svarīgi: bots nosūta atgādinājumus 24 stundas pirms pieraksta un no rīta vizītes dienā. "
+            "Ja apstiprināsiet agrāk — rīta atgādinājums netiks sūtīts."
         )
     return (
         "Запись к Лучшему Барберу, Парикмахеру и Другу — без звонков и ожидания!\n\n"
         "🗓️ Выберите день (сегодня / завтра / послезавтра)\n"
-        "⌚️ Укажите удобное время\n"
+        "⌚️ Выберите свободное время — бот показывает окна из календаря\n"
         "💇 Выберите услугу\n"
         "☑️ Получите подтверждение от барбера\n\n"
         "💈 Адрес: Jasmuižas iela 9, Rīga\n"
         "Языки: русский и латышский\n\n"
         "Просто нажмите Start и выбирайте, что актуально.\n\n"
-        "Важно: бот отправляет напоминания за 24 часа до записи и в тот же день. "
-        "Если подтвердите в первый раз — утром того же дня оповещения не будет."
+        "Важно: бот отправляет напоминания за 24 часа до записи и утром в день визита. "
+        "Если подтвердите заранее — утреннее напоминание не придёт."
     )
 
 
@@ -496,6 +496,60 @@ def clear_all_blocked() -> int:
     return count
 
 
+
+# ---------- Google Calendar block event ids (bot → calendar sync) ----------
+
+def _gcal_blocks(runtime=None) -> dict:
+    runtime = runtime or get_runtime()
+    return dict(runtime.get("gcal_block_events") or {})
+
+
+def remember_gcal_block(key: str, event_id: str):
+    """key = DD/MM/YYYY or range:START:END"""
+    if not event_id:
+        return
+    runtime = get_runtime()
+    blocks = dict(runtime.get("gcal_block_events") or {})
+    blocks[key] = event_id
+    runtime["gcal_block_events"] = blocks
+    save_runtime(runtime)
+
+
+def pop_gcal_block(key: str) -> str | None:
+    runtime = get_runtime()
+    blocks = dict(runtime.get("gcal_block_events") or {})
+    eid = blocks.pop(key, None)
+    runtime["gcal_block_events"] = blocks
+    save_runtime(runtime)
+    return eid
+
+
+def pop_gcal_blocks_matching(predicate) -> list[str]:
+    """Remove keys where predicate(key) is True; return event ids."""
+    runtime = get_runtime()
+    blocks = dict(runtime.get("gcal_block_events") or {})
+    removed = []
+    keep = {}
+    for k, eid in blocks.items():
+        if predicate(k):
+            if eid:
+                removed.append(eid)
+        else:
+            keep[k] = eid
+    runtime["gcal_block_events"] = keep
+    save_runtime(runtime)
+    return removed
+
+
+def clear_gcal_block_ids() -> list[str]:
+    runtime = get_runtime()
+    blocks = dict(runtime.get("gcal_block_events") or {})
+    ids = [v for v in blocks.values() if v]
+    runtime["gcal_block_events"] = {}
+    save_runtime(runtime)
+    return ids
+
+
 # ---------- Daily capacity (max requests per day) ----------
 
 def get_max_bookings_per_day() -> int:
@@ -607,7 +661,30 @@ def save_pending_booking(
         "service_name": service_name or "",
         "extracted_time": extracted_time or "",
         "created_at": _time.time(),
+        "group_message_id": None,
     }
+    runtime["pending_bookings"] = pending
+    save_runtime(runtime)
+
+
+def get_pending_booking(user_id: int) -> dict | None:
+    runtime = get_runtime()
+    pending = runtime.get("pending_bookings", {}) or {}
+    p = pending.get(str(user_id))
+    if isinstance(p, dict):
+        out = dict(p)
+        out["user_id"] = str(user_id)
+        return out
+    return None
+
+
+def set_pending_group_message(user_id: int, message_id: int) -> None:
+    runtime = get_runtime()
+    pending = runtime.get("pending_bookings", {}) or {}
+    key = str(user_id)
+    if key not in pending or not isinstance(pending[key], dict):
+        return
+    pending[key]["group_message_id"] = int(message_id)
     runtime["pending_bookings"] = pending
     save_runtime(runtime)
 
@@ -910,10 +987,10 @@ def reschedule_booking(
 
 
 def get_active_bookings_for_user(user_id: int) -> list:
+    """Today + future confirmed bookings for this client only."""
     return [
-        b for b in get_confirmed_bookings()
+        b for b in get_all_active_bookings()
         if int(b.get("user_id", 0)) == int(user_id)
-        and b.get("status") == "confirmed"
     ]
 
 
@@ -951,12 +1028,29 @@ def get_booking(booking_id: str) -> dict | None:
 
 
 def get_all_active_bookings() -> list:
-    """All confirmed (not cancelled/completed) bookings. Archives past dates first."""
+    """Confirmed bookings for today and future only. Past dates archived."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Europe/Riga")).date()
+    except Exception:
+        today = datetime.now().date()
     try:
         archive_past_bookings()
     except Exception:
         pass
-    return [b for b in get_confirmed_bookings() if b.get("status") == "confirmed"]
+    out = []
+    for b in get_confirmed_bookings():
+        if b.get("status") != "confirmed":
+            continue
+        d = _parse_ddmmyyyy(b.get("date") or "")
+        if d is None:
+            # keep unparseable as active so they stay visible for manual cleanup
+            out.append(b)
+            continue
+        if d >= today:
+            out.append(b)
+    return out
 
 
 def find_active_bookings(query: str) -> list:
@@ -985,13 +1079,13 @@ def find_active_bookings(query: str) -> list:
 # ---------- Load / capacity display ----------
 
 def format_day_load(date_str: str) -> str:
+    """Count only — no capacity fraction (Calendar owns capacity)."""
     n = count_demand_for_date(date_str)
-    lim = get_max_bookings_per_day()
-    return f"{n}/{lim}"
+    return str(n)
 
 
 def format_near_days_load() -> str:
-    """Today / tomorrow / day-after load lines (RU)."""
+    """Today / tomorrow / day-after — only closed days or days with demand."""
     from datetime import datetime, timedelta
     today = datetime.now().date()
     lines = []
@@ -1002,9 +1096,13 @@ def format_near_days_load() -> str:
             reason = get_day_close_reason(d) or "block"
             tag = "🏖 отпуск" if reason == "vacation" else "🔒 блок"
             lines.append(f"• {lab} ({d}): {tag}")
-        else:
-            lines.append(f"• {lab} ({d}): {format_day_load(d)}")
-    return "\n".join(lines)
+            continue
+        n = count_demand_for_date(d)
+        if n > 0:
+            lines.append(f"• {lab} ({d}): <b>{n}</b>")
+    if not lines:
+        return "Ближайшие дни: записей нет."
+    return '\n'.join(lines)
 
 
 def maybe_notify_day_almost_full(date_str: str) -> str | None:
@@ -1028,8 +1126,8 @@ def maybe_notify_day_almost_full(date_str: str) -> str | None:
     runtime["capacity_notified_days"] = list(notified)[-100:]
     save_runtime(runtime)
     if n >= lim:
-        return f"⚠️ <b>День заполнен:</b> {date_str} — {n}/{lim} заявок"
-    return f"⚠️ <b>День почти полный:</b> {date_str} — {n}/{lim} заявок"
+        return f"⚠️ <b>День заполнен:</b> {date_str} — {n} заявок"
+    return f"⚠️ <b>День почти полный:</b> {date_str} — {n} заявок"
 
 
 # ---------- Time extraction from free text ----------
@@ -1060,9 +1158,13 @@ def get_service_by_id(service_id: str) -> dict | None:
 # ---------- Archive past confirmed bookings ----------
 
 def archive_past_bookings() -> int:
-    """Mark confirmed bookings with date before today as status=completed. Returns count."""
+    """Mark confirmed bookings with date before today (Europe/Riga) as completed."""
     from datetime import datetime
-    today = datetime.now().date()
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Europe/Riga")).date()
+    except Exception:
+        today = datetime.now().date()
     runtime = get_runtime()
     bookings = runtime.get("confirmed_bookings", []) or []
     n = 0
@@ -1070,6 +1172,16 @@ def archive_past_bookings() -> int:
         if b.get("status") != "confirmed":
             continue
         d = _parse_ddmmyyyy(b.get("date") or "")
+        if d is None:
+            # try loose parse
+            raw = (b.get("date") or "").strip().replace(".", "/")
+            parts = raw.split("/")
+            if len(parts) == 3:
+                try:
+                    from datetime import date as _date
+                    d = _date(int(parts[2]), int(parts[1]), int(parts[0]))
+                except Exception:
+                    d = None
         if d and d < today:
             b["status"] = "completed"
             n += 1
@@ -1099,8 +1211,7 @@ def week_overview() -> str:
     today = datetime.now().date()
     monday = today - timedelta(days=today.weekday())
     names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    lim = get_max_bookings_per_day()
-    lines = [f"📅 <b>Неделя</b> (лимит {lim}/день)", ""]
+    lines = ["📅 <b>Неделя</b> (только число заявок, без лимита)", ""]
     for i in range(7):
         d = monday + timedelta(days=i)
         key = d.strftime("%d/%m/%Y")
@@ -1110,7 +1221,11 @@ def week_overview() -> str:
             tag = "отпуск" if reason == "vacation" else "блок"
             lines.append(f"{names[i]} {key}: {tag}{mark}")
         else:
-            lines.append(f"{names[i]} {key}: {format_day_load(key)}{mark}")
+            n = count_demand_for_date(key)
+            if n > 0:
+                lines.append(f"{names[i]} {key}: <b>{n}</b>{mark}")
+            else:
+                lines.append(f"{names[i]} {key}: —{mark}")
     pending_n = len(list_pending_bookings())
     lines.append("")
     lines.append(f"⏳ Ожидают ответа: <b>{pending_n}</b>")

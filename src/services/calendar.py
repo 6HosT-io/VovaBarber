@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,22 @@ DEFAULT_START = os.getenv("CALENDAR_DEFAULT_START", "08:30")
 # Barber plans ~1h per client
 DEFAULT_DURATION_MIN = int(os.getenv("CALENDAR_DEFAULT_DURATION_MIN", "30"))
 DAY_END = os.getenv("CALENDAR_DAY_END", "21:00")
+
 SLOT_STEP_MIN = int(os.getenv("CALENDAR_SLOT_STEP_MIN", "30"))
+# Don't offer a slot starting sooner than this many minutes from now
+SLOT_LEAD_MIN = int(os.getenv("CALENDAR_SLOT_LEAD_MIN", "15"))
+
+
+def get_tz():
+    try:
+        return ZoneInfo(TIMEZONE)
+    except Exception:
+        return ZoneInfo("Europe/Riga")
+
+
+def now_local() -> datetime:
+    return datetime.now(get_tz())
+
 
 COLOR_CLIENT = "10"   # green / basil
 COLOR_BLOCK = "11"    # red / tomato
@@ -98,18 +114,20 @@ def get_calendar_service():
 
 
 
-def diagnose() -> str:
-    """Human-readable status for /test_calendar."""
+def diagnose(date_str: str | None = None) -> str:
+    """Human-readable status for /test_calendar [DD/MM/YYYY]."""
     lines = []
     path = _credentials_path()
     lines.append(f"credentials path: {path}")
     lines.append(f"credentials exists: {path.exists()}")
     lines.append(f"GOOGLE_CALENDAR_ID: {get_calendar_id()!r}")
     lines.append(f"TIMEZONE: {TIMEZONE}")
-    lines.append(f"default start: {DEFAULT_START}, duration: {DEFAULT_DURATION_MIN}m")
+    lines.append(
+        f"default start: {DEFAULT_START}, duration: {DEFAULT_DURATION_MIN}m, day_end: {DAY_END}"
+    )
     if not path.exists():
         lines.append("FAIL: JSON file missing on server")
-        return "\n".join(lines)
+        return chr(10).join(lines)
     try:
         import json
         data = json.loads(path.read_text())
@@ -117,33 +135,71 @@ def diagnose() -> str:
         lines.append(f"project_id: {data.get('project_id', '?')}")
     except Exception as e:
         lines.append(f"FAIL: cannot read JSON: {e}")
-        return "\n".join(lines)
+        return chr(10).join(lines)
     svc = get_calendar_service()
     if not svc:
         lines.append("FAIL: could not build Calendar API client")
         if _LAST_INIT_ERROR:
             lines.append(f"error: {_LAST_INIT_ERROR}")
-        lines.append("Tip: on server run: cd /opt/VovaBarbershopBot && source venv/bin/activate && pip install google-api-python-client google-auth google-auth-httplib2")
-        return "\n".join(lines)
+        return chr(10).join(lines)
     try:
-        cal = svc.calendars().get(calendarId=get_calendar_id()).execute()
-        lines.append(f"calendar summary: {cal.get('summary')}")
-        lines.append(f"calendar access: {cal.get('accessRole')}")
+        calmeta = svc.calendars().get(calendarId=get_calendar_id()).execute()
+        lines.append(f"calendar summary: {calmeta.get('summary')}")
+        lines.append(f"calendar access: {calmeta.get('accessRole')}")
         lines.append("OK: API can read this calendar")
     except Exception as e:
         lines.append(f"FAIL: calendars.get: {e}")
-        lines.append("Often: wrong Calendar ID, or not shared with client_email (Make changes to events)")
-        return "\n".join(lines)
+        lines.append("Often: wrong Calendar ID, or not shared with client_email")
+        return chr(10).join(lines)
+
+    check = (date_str or "").strip() or now_local().strftime("%d/%m/%Y")
+    check = check.replace(".", "/")
+    lines.append(f"--- slots check for {check} ---")
+    invalidate_slots_cache(check)
     try:
-        from datetime import datetime as dt
-        today = dt.now().strftime("%d/%m/%Y")
-        evs = list_events_for_day(today)
-        lines.append(f"events today ({today}): {len(evs)}")
-        for ev in evs[:5]:
-            lines.append(f"  - {ev.get('summary')} | {ev.get('start')} → {ev.get('end')} | block={ev.get('is_block')}")
+        tz = get_tz()
+        base = parse_date_ddmmyyyy(check)
+        if base:
+            day_start = datetime(base.year, base.month, base.day, 0, 0, 0, tzinfo=tz)
+            day_end = day_start + timedelta(days=1)
+            lines.append(f"timeMin={day_start.isoformat()}")
+            lines.append(f"timeMax={day_end.isoformat()}")
     except Exception as e:
-        lines.append(f"list events: {e}")
-    return "\n".join(lines)
+        lines.append(f"range build: {e}")
+
+    evs = list_events_for_day(check)
+    lines.append(f"raw events from API: {len(evs)}")
+    for ev in evs[:15]:
+        lines.append(
+            f"  • {ev.get('summary')!r} | {ev.get('start')} → {ev.get('end')} | "
+            f"color={ev.get('colorId')} block={ev.get('is_block')}"
+        )
+    busy = get_busy_intervals(check)
+    lines.append(f"busy intervals: {len(busy)}")
+    for a, b in busy:
+        lines.append(f"  • {_fmt_minutes(a)}-{_fmt_minutes(b)}")
+    slots = get_available_slots(check, use_cache=False)
+    lines.append(
+        f"free slots ({len(slots)}): {', '.join(slots[:16])}"
+        + ("…" if len(slots) > 16 else "")
+    )
+    if not evs:
+        lines.append(
+            "NOTE: 0 events on this day → event may be on another calendar "
+            "(primary/Gmail), not this Calendar ID."
+        )
+    lines.append("--- any events on this calendar (± window) ---")
+    upcoming = list_upcoming_events()
+    lines.append(f"events in window: {len(upcoming)}")
+    if not upcoming:
+        lines.append(
+            "Calendar «Клиенты» is EMPTY for the bot. "
+            "Create event while only «Клиенты» is selected, or use /test_calendar "
+            "without date (writes a test event you should see in Google)."
+        )
+    for ev in upcoming[:12]:
+        lines.append(f"  • {ev.get('summary')!r} | {ev.get('start')} → {ev.get('end')}")
+    return chr(10).join(lines)
 
 
 def test_write_event() -> str:
@@ -212,7 +268,7 @@ def create_event(
     Create a *client* booking event (green by default).
     date_str: DD/MM/YYYY
     Start: explicit start_time, else from comment, else DEFAULT_START (08:30).
-    Duration: default 60 min.
+    Duration: default 30 min (CALENDAR_DEFAULT_DURATION_MIN).
     Returns Google event id or None.
     """
     service = get_calendar_service()
@@ -255,6 +311,57 @@ def create_event(
         return event_id
     except Exception as e:
         logger.error(f"Failed to create calendar event: {e}")
+        return None
+
+
+
+def _to_iso_date(date_str: str) -> str | None:
+    base = parse_date_ddmmyyyy(date_str)
+    if not base:
+        return None
+    return base.strftime("%Y-%m-%d")
+
+
+def create_all_day_block(
+    start_date: str,
+    end_date: str | None = None,
+    *,
+    title: str = "Не работаю",
+    description: str = "Блок из бота (/block или /vacation)",
+) -> str | None:
+    """
+    All-day red event on «Клиенты».
+    start_date / end_date: DD/MM/YYYY inclusive.
+    Google end.date is exclusive → we add +1 day.
+    """
+    service = get_calendar_service()
+    if not service:
+        return None
+    start_iso = _to_iso_date(start_date)
+    end_inclusive = end_date or start_date
+    end_base = parse_date_ddmmyyyy(end_inclusive)
+    if not start_iso or not end_base:
+        return None
+    end_exclusive = (end_base + timedelta(days=1)).strftime("%Y-%m-%d")
+    body = {
+        "summary": f"{PREFIX_BLOCK}{title}",
+        "description": description,
+        "colorId": COLOR_BLOCK,
+        "start": {"date": start_iso},
+        "end": {"date": end_exclusive},
+    }
+    try:
+        created = (
+            service.events()
+            .insert(calendarId=get_calendar_id(), body=body)
+            .execute()
+        )
+        eid = created.get("id")
+        logger.info(f"Calendar all-day block: {eid} {start_iso}→{end_exclusive}")
+        invalidate_slots_cache()
+        return eid
+    except Exception as e:
+        logger.error(f"create_all_day_block failed: {e}")
         return None
 
 
@@ -301,10 +408,53 @@ def create_block_event(
         )
         eid = created.get("id")
         logger.info(f"Calendar block event created: {eid}")
+        invalidate_slots_cache(date_str)
         return eid
     except Exception as e:
         logger.error(f"Failed to create block event: {e}")
         return None
+
+
+
+def list_upcoming_events(days_back: int = 7, days_forward: int = 60, limit: int = 30) -> list[dict]:
+    """Any events on the connected calendar in a wide window (debug empty-day cases)."""
+    service = get_calendar_service()
+    if not service:
+        return []
+    tz = get_tz()
+    now = now_local()
+    time_min = (now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    time_max = (now + timedelta(days=days_forward)).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    items: list = []
+    page_token = None
+    try:
+        while True:
+            kwargs = dict(
+                calendarId=get_calendar_id(),
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                timeZone=TIMEZONE,
+                maxResults=100,
+            )
+            if page_token:
+                kwargs["pageToken"] = page_token
+            result = service.events().list(**kwargs).execute()
+            items.extend(result.get("items") or [])
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as e:
+        logger.error(f"list_upcoming_events: {e}")
+        return []
+    out = []
+    for ev in items[:limit]:
+        summary = ev.get("summary") or ""
+        start = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date")
+        end = (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date")
+        out.append({"summary": summary, "start": start, "end": end, "id": ev.get("id")})
+    return out
 
 
 def list_events_for_day(date_str: str) -> list[dict]:
@@ -319,10 +469,15 @@ def list_events_for_day(date_str: str) -> list[dict]:
     base = parse_date_ddmmyyyy(date_str)
     if not base:
         return []
-    day_start = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Google requires RFC3339 with mandatory timezone offset on timeMin/timeMax
+    try:
+        tz = ZoneInfo(TIMEZONE)
+    except Exception:
+        tz = ZoneInfo("Europe/Riga")
+    day_start = datetime(base.year, base.month, base.day, 0, 0, 0, tzinfo=tz)
     day_end = day_start + timedelta(days=1)
-    time_min = day_start.strftime("%Y-%m-%dT00:00:00")
-    time_max = day_end.strftime("%Y-%m-%dT00:00:00")
+    time_min = day_start.isoformat()
+    time_max = day_end.isoformat()
 
     items: list = []
     page_token = None
@@ -376,6 +531,67 @@ def list_events_for_day(date_str: str) -> list[dict]:
     return out
 
 
+
+def get_event(event_id: str) -> dict | None:
+    """
+    Fetch one event by id. Returns None if missing/deleted/404.
+    Keys: id, summary, start, end, status (incl. cancelled).
+    """
+    service = get_calendar_service()
+    if not service or not event_id:
+        return None
+    try:
+        ev = (
+            service.events()
+            .get(calendarId=get_calendar_id(), eventId=event_id)
+            .execute()
+        )
+        if (ev.get("status") or "").lower() == "cancelled":
+            return None
+        start = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date")
+        end = (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date")
+        return {
+            "id": ev.get("id"),
+            "summary": ev.get("summary") or "",
+            "start": start,
+            "end": end,
+            "status": ev.get("status"),
+            "raw": ev,
+        }
+    except Exception as e:
+        err = str(e).lower()
+        if "404" in err or "not found" in err or "deleted" in err:
+            logger.info(f"Calendar event gone: {event_id}")
+            return None
+        logger.warning(f"get_event {event_id}: {e}")
+        return None
+
+
+def event_local_start(ev: dict) -> tuple[str | None, str | None]:
+    """Return (DD/MM/YYYY, HH:MM) in bot TIMEZONE, or (date, None) for all-day."""
+    start_raw = (ev or {}).get("start") or ""
+    if not start_raw:
+        return None, None
+    if "T" not in str(start_raw):
+        # all-day YYYY-MM-DD
+        try:
+            y, m, d = str(start_raw)[:10].split("-")
+            return f"{d}/{m}/{y}", None
+        except Exception:
+            return None, None
+    try:
+        tz = get_tz()
+        st = str(start_raw).replace("Z", "+00:00")
+        start_dt = datetime.fromisoformat(st)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=tz)
+        local = start_dt.astimezone(tz)
+        return local.strftime("%d/%m/%Y"), local.strftime("%H:%M")
+    except Exception as e:
+        logger.warning(f"event_local_start: {e}")
+        return None, None
+
+
 def delete_event(event_id: str) -> bool:
     service = get_calendar_service()
     if not service or not event_id:
@@ -406,24 +622,37 @@ def _fmt_minutes(total: int) -> str:
 
 
 def _event_to_minutes(ev: dict, day_base: datetime) -> tuple[int, int] | None:
-    """Return (start_min, end_min) from event for local day, or None if all-day/unparseable."""
+    """Return (start_min, end_min) in local TIMEZONE minutes from midnight."""
     start_raw = ev.get("start") or ""
     end_raw = ev.get("end") or ""
     if not start_raw:
         return None
-    # all-day: YYYY-MM-DD
+    # all-day: YYYY-MM-DD → whole day busy
     if "T" not in str(start_raw):
-        return 0, 24 * 60  # whole day busy
+        return 0, 24 * 60
     try:
-        # 2026-09-26T08:30:00+03:00 or without tz
-        st = start_raw.replace("Z", "+00:00")
-        en = (end_raw or start_raw).replace("Z", "+00:00")
-        from datetime import datetime as dt
-        start_dt = dt.fromisoformat(st)
-        end_dt = dt.fromisoformat(en)
-        # compare by clock time in event (API already in calendar tz often)
-        sm = start_dt.hour * 60 + start_dt.minute
-        em = end_dt.hour * 60 + end_dt.minute
+        try:
+            tz = ZoneInfo(TIMEZONE)
+        except Exception:
+            tz = ZoneInfo("Europe/Riga")
+        st = str(start_raw).replace("Z", "+00:00")
+        en = str(end_raw or start_raw).replace("Z", "+00:00")
+        start_dt = datetime.fromisoformat(st)
+        end_dt = datetime.fromisoformat(en)
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=tz)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=tz)
+        start_local = start_dt.astimezone(tz)
+        end_local = end_dt.astimezone(tz)
+        sm = start_local.hour * 60 + start_local.minute
+        em = end_local.hour * 60 + end_local.minute
+        # multi-day timed: clamp to this local day
+        day0 = datetime(day_base.year, day_base.month, day_base.day, tzinfo=tz)
+        if start_local.date() < day0.date():
+            sm = 0
+        if end_local.date() > day0.date():
+            em = 24 * 60
         if em <= sm:
             em = sm + DEFAULT_DURATION_MIN
         return sm, em
@@ -443,8 +672,13 @@ def get_busy_intervals(date_str: str) -> list[tuple[int, int]]:
         pair = _event_to_minutes(ev, base)
         if pair:
             busy.append(pair)
+            logger.info(
+                f"busy {date_str}: {ev.get('summary')!r} "
+                f"{_fmt_minutes(pair[0])}-{_fmt_minutes(pair[1])}"
+            )
+    if not events:
+        logger.info(f"busy {date_str}: no events from Calendar API")
     busy.sort()
-    # merge overlaps
     merged: list[list[int]] = []
     for s, e in busy:
         if not merged or s > merged[-1][1]:
@@ -513,7 +747,7 @@ def get_available_slots(
     day_start: str | None = None,
     day_end: str | None = None,
     step_min: int | None = None,
-    limit: int = 24,
+    limit: int = 48,
     use_cache: bool = True,
 ) -> list[str]:
     """
@@ -536,15 +770,26 @@ def get_available_slots(
 
     busy = get_busy_intervals(date_str)
     candidates = []
-    t = day_start_m
-    while t + dur <= day_end_m:
-        if _slot_fits(t, dur, busy, day_end_m):
-            score = _adjacency_score(t, dur, busy)
-            candidates.append((score, t))
-        t += step
-    # score tuple: higher first, then earlier time (-start already in tuple)
-    candidates.sort(key=lambda x: (-x[0], x[1]))  # high score, then earlier
-    out = [_fmt_minutes(t) for _, t in candidates[:limit]]
+    cursor = day_start_m
+    # For "today": do not offer slots that already started (lead time buffer)
+    min_start_m = day_start_m
+    base_day = parse_date_ddmmyyyy(date_str)
+    if base_day:
+        nl = now_local()
+        if nl.year == base_day.year and nl.month == base_day.month and nl.day == base_day.day:
+            min_start_m = max(
+                day_start_m,
+                nl.hour * 60 + nl.minute + SLOT_LEAD_MIN,
+            )
+    while cursor + dur <= day_end_m:
+        if cursor >= min_start_m and _slot_fits(cursor, dur, busy, day_end_m):
+            score = _adjacency_score(cursor, dur, busy)
+            candidates.append((score, cursor))
+        cursor += step
+    # Chronological order for clients (adjacency score kept for future ranking if needed)
+    candidates.sort(key=lambda x: x[1])
+    out = [_fmt_minutes(m) for _, m in candidates[:limit]]
+
     _slots_cache[cache_key] = (_time.time(), list(out))
     return out
 
@@ -555,3 +800,26 @@ def slots_keyboard_rows(slots: list[str], prefix: str = "slot") -> list[list[str
 
     """Helper: chunk slot times for buttons (values only)."""
     return slots
+
+
+def day_is_bookable(date_str: str) -> tuple[bool, str]:
+    """
+    (ok, reason_code)
+    reason_code: ok | blocked | no_slots | past
+    Uses bot blocks + live calendar slots (respects "now" for today).
+    """
+    try:
+        from src.services import settings_store as store
+        if store.is_blocked(date_str):
+            return False, "blocked"
+    except Exception:
+        pass
+    slots = get_available_slots(date_str, use_cache=True)
+    if not slots:
+        base = parse_date_ddmmyyyy(date_str)
+        if base:
+            nl = now_local()
+            if (nl.year, nl.month, nl.day) == (base.year, base.month, base.day):
+                return False, "past"
+        return False, "no_slots"
+    return True, "ok"
