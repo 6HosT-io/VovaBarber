@@ -92,8 +92,12 @@ def parse_ddmmyyyy(text: str):
 
 
 def resolve_date(day_key: str) -> str:
-    """Return date as DD/MM/YYYY"""
-    today = datetime.now().date()
+    """Return date as DD/MM/YYYY in bot timezone (Europe/Riga)."""
+    try:
+        from src.services import calendar as gcal
+        today = gcal.now_local().date()
+    except Exception:
+        today = datetime.now().date()
     if day_key == "today":
         d = today
     elif day_key == "tomorrow":
@@ -162,8 +166,11 @@ async def cmd_start(message: Message, state: FSMContext):
     short_fallback_ru = "Привет! Я бот барбершопа. Здесь можно быстро записаться."
     short_fallback_lv = "Sveiki! Esmu frizētavas bots. Šeit var ātri pierakstīties."
     if custom and custom not in (short_fallback_ru, short_fallback_lv):
-        # Always append short privacy note even to custom welcome
-        caption = custom + (privacy_ru if lang == "ru" else privacy_lv)
+        caption = custom.strip()
+        # Append privacy only if not already present (e.g. pasted full text via /settings)
+        marker = "Третьим лицам не передаём" if lang == "ru" else "Trešajām personām netiek nodoti"
+        if marker not in caption:
+            caption = caption + (privacy_ru if lang == "ru" else privacy_lv)
     else:
         caption = defaults[lang]
 
@@ -263,10 +270,33 @@ async def _apply_reschedule_day(callback: CallbackQuery, state: FSMContext, day_
 
 @router.callback_query(F.data.startswith("day:"))
 async def process_day(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+
+    # Unavailable day chip (Telegram cannot disable buttons — alert only)
+    if len(parts) >= 2 and parts[1] == "na":
+        reason = parts[3] if len(parts) > 3 else "no_slots"
+        if lang == "ru":
+            texts = {
+                "blocked": "Этот день закрыт (отпуск / блок).",
+                "past": "На сегодня свободных окон уже нет — выберите другой день.",
+                "no_slots": "В этот день нет свободного времени (календарь занят).",
+            }
+            msg = texts.get(reason, "Этот день недоступен для записи.")
+        else:
+            texts = {
+                "blocked": "Šī diena ir slēgta (atvaļinājums / bloks).",
+                "past": "Šodien brīvu laiku vairs nav — izvēlieties citu dienu.",
+                "no_slots": "Šajā dienā nav brīva laika (kalendārs aizņemts).",
+            }
+            msg = texts.get(reason, "Šī diena nav pieejama.")
+        await callback.answer(msg, show_alert=True)
+        return
+
     current = await state.get_state()
-    # Reschedule flow uses the same day buttons — handle here so callback is answered
     if current == BookingStates.reschedule_date.state:
-        day_key = callback.data.split(":")[1]
+        day_key = parts[1]
         await _apply_reschedule_day(callback, state, day_key)
         return
     if current in (
@@ -275,10 +305,8 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
     ):
         await callback.answer()
         return
-    day_key = callback.data.split(":")[1]
-    lang_code = (callback.from_user.language_code or "ru").lower()
-    lang = "lv" if lang_code.startswith("lv") else "ru"
 
+    day_key = parts[1]
     if day_key == "other":
         await state.update_data(day_key="other")
         await state.set_state(BookingStates.waiting_custom_date)
@@ -295,6 +323,18 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
 
     date_str = resolve_date(day_key)
     if await _deny_if_closed_or_full(callback, date_str, lang, as_callback=True):
+        return
+    from src.services import calendar as gcal
+    ok, reason = gcal.day_is_bookable(date_str)
+    if not ok:
+        if lang == "ru":
+            msg = (
+                "На сегодня окон уже нет." if reason == "past"
+                else "В этот день нет свободного времени."
+            )
+        else:
+            msg = "Šajā dienā nav brīva laika."
+        await callback.answer(msg, show_alert=True)
         return
 
     await state.update_data(day_key=day_key, date=date_str)
@@ -408,80 +448,106 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
         parts.append(
             ("Услуга: <b>%s</b>" if lang == "ru" else "Pakalpojums: <b>%s</b>") % service_name
         )
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     if lang == "ru":
         parts.append("Дата: <b>%s</b> · <b>%s</b>" % (date_str, slot))
         parts.append("")
-        parts.append("Комментарий для барбера (или «-»).")
-        parts.append("Время уже выбрано слотом.")
+        parts.append("Можно добавить комментарий барберу — или отправить заявку сразу.")
+        skip_label = "✅ Отправить без комментария"
     else:
         parts.append("Datums: <b>%s</b> · <b>%s</b>" % (date_str, slot))
         parts.append("")
-        parts.append("Komentārs barberam (vai «-»).")
-    await callback.message.edit_text(chr(10).join(parts))
+        parts.append("Var pievienot komentāru — vai nosūtīt pieteikumu uzreiz.")
+        skip_label = "✅ Nosūtīt bez komentāra"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=skip_label, callback_data="comment:skip")]]
+    )
+    await callback.message.edit_text(chr(10).join(parts), reply_markup=kb)
     await callback.answer()
 
 
-@router.message(BookingStates.waiting_comment)
-async def process_comment(message: Message, state: FSMContext, bot: Bot):
+
+async def _finish_booking_request(user, state: FSMContext, bot: Bot, *, raw_comment: str, reply_target, lang: str):
+    """Shared submit after service: optional free-text note."""
     data = await state.get_data()
     day_key = data.get("day_key", "—")
     date_str = data.get("date", "—")
     slot = data.get("slot") or ""
-    raw = (message.text or "").strip() or "—"
-    # Slot is source of truth for time; keep client note separate
+    raw = (raw_comment or "").strip()
+    if raw in ("", "—", "-"):
+        raw = ""
     if slot:
-        comment = f"{slot}" + (f" · {raw}" if raw not in ("—", "-", "") else "")
+        comment = f"{slot}" + (f" · {raw}" if raw else "")
     else:
-        comment = raw
+        comment = raw or "—"
     service_id = data.get("service_id") or ""
     service_name = data.get("service_name") or ""
-    lang = get_lang(message)
     from src.services import settings_store as store
 
-    # re-check capacity at submit
     if store.is_blocked(date_str):
         await state.clear()
-        await message.answer(store.client_unavailable_message(date_str, lang), reply_markup=main_menu_kb(lang))
+        await reply_target.answer(
+            store.client_unavailable_message(date_str, lang),
+            reply_markup=main_menu_kb(lang),
+        )
         return
 
     await state.clear()
     extracted = slot or store.extract_time_hint(comment)
     day_name = day_label(day_key, lang)
-    svc_line = f"\nУслуга: <b>{service_name}</b>" if service_name else ""
-    time_line = f"\nВремя: <b>{extracted}</b>" if extracted else ""
-    client_text = (
-        f"✅ Заявка отправлена!\n\n"
-        f"День: <b>{day_name}</b> ({date_str}){svc_line}{time_line}\n"
-        f"Комментарий: {comment}\n\n"
-        f"Барбер скоро подтвердит или предложит другое время."
-        if lang == "ru"
-        else f"✅ Pieprasījums nosūtīts!\n\n"
-        f"Diena: <b>{day_name}</b> ({date_str})\n"
-        f"Komentārs: {comment}"
-    )
-    await message.answer(client_text, reply_markup=main_menu_kb(lang))
+    svc_line = ("\nУслуга: <b>%s</b>" % service_name) if service_name else ""
+    time_line = ("\nВремя: <b>%s</b>" % extracted) if extracted else ""
+    nl = chr(10)
+    if lang == "ru":
+        client_text = (
+            f"✅ Заявка отправлена!{nl}{nl}"
+            f"День: <b>{day_name}</b> ({date_str})"
+            + svc_line.replace("\\n", nl).replace("\n", nl)
+            + time_line.replace("\\n", nl).replace("\n", nl)
+            + f"{nl}Комментарий: {comment or '—'}{nl}{nl}"
+            f"Барбер скоро подтвердит или предложит другое время."
+        )
+    else:
+        client_text = (
+            f"✅ Pieprasījums nosūtīts!{nl}{nl}"
+            f"Diena: <b>{day_name}</b> ({date_str}){nl}"
+            f"Komentārs: {comment or '—'}"
+        )
+    withdraw_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="↩️ Отозвать заявку" if lang == "ru" else "↩️ Atcelt pieteikumu",
+            callback_data="pend:withdraw",
+        )]
+    ])
+    # Reply keyboard (main menu) stays; this adds inline withdraw under the success text
+    await reply_target.answer(client_text, reply_markup=withdraw_kb)
 
     if ADMIN_GROUP_ID:
-        user = message.from_user
         client_line = store.format_client_line(user.id, user.full_name, ref_date=date_str)
         group_text = (
-            f"🆕 <b>Новая заявка</b>\n\n"
-            f"{client_line}\n"
-            f"📅 День: <b>{day_label(day_key, 'ru')}</b> ({date_str})\n"
+            f"🆕 <b>Новая заявка</b>{nl}{nl}"
+            f"{client_line}{nl}"
+            f"📅 День: <b>{day_label(day_key, 'ru')}</b> ({date_str}){nl}"
         )
         if service_name:
-            group_text += f"✂️ Услуга: <b>{service_name}</b>\n"
+            group_text += f"✂️ Услуга: <b>{service_name}</b>{nl}"
         if extracted:
-            group_text += f"🕐 Время: <b>{extracted}</b>\n"
-        group_text += f"💬 Комментарий: {comment}"
+            group_text += f"🕐 Время: <b>{extracted}</b>{nl}"
+        group_text += f"💬 Комментарий: {comment or '—'}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:ok:{user.id}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{user.id}"),
             ],
             [
-                InlineKeyboardButton(text="💬 Написать клиенту", url=store.client_chat_url(user.id, user.username)),
-                InlineKeyboardButton(text="📝 Имя в контактах", callback_data=f"adm:setname:{user.id}"),
+                InlineKeyboardButton(
+                    text="💬 Написать клиенту",
+                    url=store.client_chat_url(user.id, user.username),
+                ),
+                InlineKeyboardButton(
+                    text="📝 Имя в контактах",
+                    callback_data=f"adm:setname:{user.id}",
+                ),
             ],
         ])
         try:
@@ -497,18 +563,118 @@ async def process_comment(message: Message, state: FSMContext, bot: Bot):
                 extracted_time=extracted,
             )
             store.track_event("book_request", user.id)
-            await bot.send_message(ADMIN_GROUP_ID, group_text, reply_markup=kb)
+            sent = await bot.send_message(ADMIN_GROUP_ID, group_text, reply_markup=kb)
+            try:
+                store.set_pending_group_message(user.id, sent.message_id)
+            except Exception:
+                pass
             notice = store.maybe_notify_day_almost_full(date_str)
             if notice:
                 await bot.send_message(ADMIN_GROUP_ID, notice)
             logger.info(f"Booking request from {user.id} sent to group")
         except Exception as e:
             logger.error(f"Failed to send booking to group: {e}")
-            await message.answer(
+            await reply_target.answer(
                 "Заявка принята, но не удалось уведомить барбера." if lang == "ru"
                 else "Pieprasījums pieņemts, bet neizdevās paziņot."
             )
 
+
+@router.callback_query(BookingStates.waiting_comment, F.data == "comment:skip")
+async def process_comment_skip(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _finish_booking_request(
+        callback.from_user,
+        state,
+        bot,
+        raw_comment="",
+        reply_target=callback.message,
+        lang=lang,
+    )
+
+
+@router.message(BookingStates.waiting_comment)
+async def process_comment(message: Message, state: FSMContext, bot: Bot):
+    lang = get_lang(message)
+    raw = (message.text or "").strip()
+    await _finish_booking_request(
+        message.from_user,
+        state,
+        bot,
+        raw_comment=raw,
+        reply_target=message,
+        lang=lang,
+    )
+
+
+
+
+@router.callback_query(F.data == "pend:withdraw")
+async def client_withdraw_pending(callback: CallbackQuery, bot: Bot):
+    """Client revokes pending request before barber confirms."""
+    lang_code = (callback.from_user.language_code or "ru").lower()
+    lang = "lv" if lang_code.startswith("lv") else "ru"
+    from src.services import settings_store as store
+    uid = callback.from_user.id
+    pending = store.get_pending_booking(uid)
+    if not pending:
+        await callback.answer(
+            "Заявка уже обработана или отозвана." if lang == "ru"
+            else "Pieteikums jau apstrādāts vai atcelts.",
+            show_alert=True,
+        )
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    data = store.pop_pending_booking(uid)
+    await callback.answer("Отозвано" if lang == "ru" else "Atcelts")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    text = (
+        "↩️ Заявка отозвана. Можно записаться снова через /book."
+        if lang == "ru"
+        else "↩️ Pieteikums atcelts. Varat pierakstīties no jauna ar /book."
+    )
+    await callback.message.answer(text, reply_markup=main_menu_kb(lang))
+    if ADMIN_GROUP_ID and data:
+        try:
+            line = store.format_client_line(uid, callback.from_user.full_name)
+            nl = chr(10)
+            note = (
+                f"↩️ <b>Клиент отозвал заявку</b>{nl}"
+                f"{line}{nl}"
+                f"📅 {data.get('date')} · {data.get('extracted_time') or ''}{nl}"
+                f"💬 {data.get('comment')}"
+            )
+            mid = data.get("group_message_id")
+            if mid:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=ADMIN_GROUP_ID,
+                        message_id=int(mid),
+                        text=note + nl + nl + "<i>Кнопки сняты — заявка отозвана клиентом.</i>",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    await bot.send_message(ADMIN_GROUP_ID, note)
+            else:
+                await bot.send_message(ADMIN_GROUP_ID, note)
+        except Exception as e:
+            logger.error(f"withdraw notify group: {e}")
+    try:
+        store.track_event("pending_withdraw", uid)
+    except Exception:
+        pass
 
 
 @router.message(Command("cancel"))

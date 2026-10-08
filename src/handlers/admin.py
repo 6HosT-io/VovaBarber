@@ -217,18 +217,19 @@ async def cmd_test_group(message: Message):
 
 @router.message(Command("test_calendar", "testcalendar", "gcal"))
 async def cmd_test_calendar(message: Message):
-    """Diagnose Google Calendar + optional write test."""
+    """Diagnose Google Calendar. Optional: /test_calendar 01/10/2026"""
     if not await require_admin_msg(message):
         return
     from src.services import calendar as gcal
-    report = gcal.diagnose()
-    # write test only if read looks OK
-    if "OK: API can read" in report:
-        report += "\n\n" + gcal.test_write_event()
-    # Telegram message limit
+    parts = (message.text or "").split(maxsplit=1)
+    date_arg = parts[1].strip() if len(parts) > 1 else None
+    report = gcal.diagnose(date_arg)
+    if "OK: API can read" in report and not date_arg:
+        report += chr(10) + chr(10) + gcal.test_write_event()
     if len(report) > 3500:
-        report = report[:3500] + "\n…"
-    await message.answer(f"<b>Google Calendar</b>\n<pre>{report}</pre>", parse_mode="HTML")
+        report = report[:3500] + chr(10) + "…"
+    await message.answer(f"<b>Google Calendar</b>{chr(10)}<pre>{report}</pre>", parse_mode="HTML")
+
 
 
 @router.callback_query(F.data == "set:show")
@@ -613,7 +614,21 @@ async def cmd_block(message: Message):
     key = to_display(d)
     from src.services import settings_store as store
     store.block_day(key, reason="block")
-    await message.answer(f"🔒 День <b>{key}</b> заблокирован.")
+    cal_note = ""
+    try:
+        from src.services import calendar as gcal
+        eid = gcal.create_all_day_block(key, key, title="Не работаю (блок)")
+        if eid:
+            store.remember_gcal_block(key, eid)
+            cal_note = "\n📅 В Google Calendar «Клиенты» добавлен день-блок."
+        elif gcal.is_configured():
+            cal_note = "\n⚠️ Calendar: не удалось создать событие."
+    except Exception as e:
+        from loguru import logger
+        logger.error(f"block→calendar: {e}")
+        cal_note = "\n⚠️ Calendar sync error."
+    await message.answer(f"🔒 День <b>{key}</b> заблокирован." + cal_note)
+
 
 
 @router.message(Command("unblock"))
@@ -635,7 +650,19 @@ async def cmd_unblock(message: Message):
     key = to_display(d)
     from src.services import settings_store as store
     store.unblock_day(key)
-    await message.answer(f"🔓 День <b>{key}</b> разблокирован.")
+    cal_note = ""
+    try:
+        from src.services import calendar as gcal
+        eid = store.pop_gcal_block(key)
+        if eid and gcal.delete_event(eid):
+            cal_note = "\n📅 Событие-блок удалено из Google Calendar."
+        elif eid:
+            cal_note = "\n⚠️ Calendar: событие не удалено (уже нет?)."
+    except Exception as e:
+        from loguru import logger
+        logger.error(f"unblock→calendar: {e}")
+    await message.answer(f"🔓 День <b>{key}</b> разблокирован." + cal_note)
+
 
 
 @router.message(Command("vacation"))
@@ -659,12 +686,27 @@ async def cmd_vacation(message: Message):
         await message.answer(err)
         return
     from src.services import settings_store as store
-    store.block_range(to_display(start), to_display(end), reason="vacation")
+    s, e = to_display(start), to_display(end)
+    store.block_range(s, e, reason="vacation")
     count = (end - start).days + 1
+    cal_note = ""
+    try:
+        from src.services import calendar as gcal
+        eid = gcal.create_all_day_block(s, e, title="Отпуск / не работаю")
+        if eid:
+            store.remember_gcal_block(f"range:{s}:{e}", eid)
+            cal_note = "\n📅 В Google Calendar добавлен блок на весь период."
+        elif gcal.is_configured():
+            cal_note = "\n⚠️ Calendar: не удалось создать событие."
+    except Exception as ex:
+        from loguru import logger
+        logger.error(f"vacation→calendar: {ex}")
+        cal_note = "\n⚠️ Calendar sync error."
     await message.answer(
         f"🏖 Отпуск: заблокировано <b>{count}</b> дн.\n"
-        f"{to_display(start)} → {to_display(end)}\n\n"
+        f"{s} → {e}\n\n"
         "Клиенты в эти дни увидят сообщение про отдых, не просто «день недоступен»."
+        + cal_note
     )
 
 
@@ -678,7 +720,7 @@ async def cmd_unvacation(message: Message):
             "🔓 Снять блок с части отпуска\n\n"
             "Синтаксис:\n"
             "<code>/unvacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ</code>\n\n"
-            "Пример: отпуск был 01/09–14/09, открыть вторую неделю:\n"
+            "Пример: отпуск был 01/09-14/09, открыть вторую неделю:\n"
             "<code>/unvacation 08/09/2026 14/09/2026</code>\n\n"
             f"{DATE_FMT_HELP}"
         )
@@ -688,10 +730,56 @@ async def cmd_unvacation(message: Message):
         await message.answer(err)
         return
     from src.services import settings_store as store
-    removed = store.unblock_range(to_display(start), to_display(end))
+    from datetime import datetime as dt
+    s, e = to_display(start), to_display(end)
+    removed = store.unblock_range(s, e)
+    cal_note = ""
+    try:
+        from src.services import calendar as gcal
+        sd = dt.strptime(s, "%d/%m/%Y").date()
+        ed = dt.strptime(e, "%d/%m/%Y").date()
+
+        def pred(k: str) -> bool:
+            if k.startswith("range:"):
+                try:
+                    _, a, b = k.split(":", 2)
+                    ad = dt.strptime(a, "%d/%m/%Y").date()
+                    bd = dt.strptime(b, "%d/%m/%Y").date()
+                    return ad <= ed and bd >= sd
+                except Exception:
+                    return False
+            try:
+                d = dt.strptime(k, "%d/%m/%Y").date()
+                return sd <= d <= ed
+            except Exception:
+                return False
+
+        eids = store.pop_gcal_blocks_matching(pred)
+        deleted = sum(1 for eid in eids if gcal.delete_event(eid))
+        recreated = 0
+        for r in store.get_vacation_ranges():
+            rs, re_ = r.get("start"), r.get("end")
+            if not rs or not re_:
+                continue
+            eid = gcal.create_all_day_block(rs, re_, title="Отпуск / не работаю")
+            if eid:
+                store.remember_gcal_block(f"range:{rs}:{re_}", eid)
+                recreated += 1
+        bits = []
+        if deleted:
+            bits.append(f"удалено {deleted}")
+        if recreated:
+            bits.append(f"пересоздано {recreated}")
+        if bits:
+            cal_note = "\n📅 Calendar: " + ", ".join(bits) + "."
+    except Exception as ex:
+        from loguru import logger
+        logger.error(f"unvacation→calendar: {ex}")
+    nl = chr(10)
     await message.answer(
-        f"🔓 Снят блок с <b>{removed}</b> дн.\n"
-        f"{to_display(start)} → {to_display(end)}"
+        f"🔓 Снят блок с <b>{removed}</b> дн.{nl}"
+        f"{s} → {e}"
+        + cal_note.replace("\\n", nl).replace("\n", nl)
     )
 
 
@@ -700,12 +788,21 @@ async def cmd_unblock_all(message: Message):
     if not is_admin(message.from_user.id):
         return
     from src.services import settings_store as store
-    count = store.clear_all_blocked()
+    n = store.clear_all_blocked()
+    cal_note = ""
+    try:
+        from src.services import calendar as gcal
+        eids = store.clear_gcal_block_ids()
+        deleted = sum(1 for eid in eids if gcal.delete_event(eid))
+        if deleted:
+            cal_note = f"\n📅 Удалено событий-блоков в Calendar: {deleted}."
+    except Exception as ex:
+        from loguru import logger
+        logger.error(f"unblock_all→calendar: {ex}")
     await message.answer(
-        f"🔓 Сняты все блокировки (<b>{count}</b> дн.).\n\n"
+        f"🔓 Снято блокировок: <b>{n}</b>." + cal_note + "\n\n"
         "Если нужно снова закрыть дни — /vacation или /block."
     )
-
 
 
 PAGE_SIZE = 5
@@ -1035,30 +1132,79 @@ async def cmd_week(message: Message):
 
 @router.message(Command("pending"))
 async def cmd_pending(message: Message):
+    """List pending with action buttons (works if group card was deleted)."""
     if not is_admin(message.from_user.id):
         return
     from src.services import settings_store as store
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     import time
     items = store.list_pending_bookings()
     if not items:
         await message.answer("⏳ Нет заявок, ожидающих ответа.")
         return
-    lines = [f"⏳ <b>Ожидают ответа: {len(items)}</b>", ""]
+    await message.answer(
+        f"⏳ <b>Ожидают ответа: {len(items)}</b>" + chr(10)
+        + "Кнопки ниже работают даже если сообщение в группе удалили."
+    )
     now = time.time()
     for p in items:
-        uid = p.get("user_id")
+        uid = int(p.get("user_id"))
         age_h = ""
         if p.get("created_at"):
             age_h = f" · {int((now - float(p['created_at'])) / 3600)}ч назад"
-        line = store.format_client_line(int(uid), p.get("client_name"), ref_date=p.get("date") or "")
-        lines.append(
-            f"{line}\n"
-            f"📅 {p.get('date')} · {p.get('service_name') or '—'} · {p.get('extracted_time') or ''}\n"
-            f"💬 {p.get('comment')}{age_h}\n"
+        line = store.format_client_line(uid, p.get("client_name"), ref_date=p.get("date") or "")
+        nl = chr(10)
+        text = (
+            f"{line}{nl}"
+            f"📅 {p.get('date')} · {p.get('service_name') or '—'} · {p.get('extracted_time') or ''}{nl}"
+            f"💬 {p.get('comment')}{age_h}{nl}"
             f"kind={p.get('kind', 'book')}"
         )
-        lines.append("")
-    await message.answer("\n".join(lines)[:4000])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:ok:{uid}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{uid}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Написать",
+                    url=store.client_chat_url(uid, None),
+                ),
+                InlineKeyboardButton(
+                    text="🗑 Снять без ответа",
+                    callback_data=f"pend:admin_clear:{uid}",
+                ),
+            ],
+        ])
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("pend:admin_clear:"))
+async def admin_clear_pending(callback: CallbackQuery):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    uid = int(callback.data.split(":")[-1])
+    data = store.pop_pending_booking(uid)
+    if not data:
+        await callback.answer("Уже нет в очереди", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    await callback.answer("Снято")
+    try:
+        body = callback.message.text or ""
+        await callback.message.edit_text(
+            body + chr(10) + chr(10) + "Снято админом без подтверждения/отказа.",
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
 
 @router.message(Command("backup"))
