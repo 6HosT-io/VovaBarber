@@ -162,6 +162,7 @@ rsync -avz --exclude venv --exclude __pycache__ --exclude .git \
   ./ root@SERVER_IP:/opt/VovaBarber/
 
 ssh root@SERVER_IP 'systemctl restart VovaBarber'
+journalctl -u VovaBarber -n 40 --no-pager
 ```
 
 Secrets stay on the server only. Unit: **`VovaBarber.service`**.
