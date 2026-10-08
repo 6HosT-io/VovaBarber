@@ -10,26 +10,84 @@ Bilingual Telegram bot for a **single-barber** shop in Riga.
 | **Dates** | DD/MM/YYYY |
 | **Server path** | `/opt/VovaBarber` |
 | **systemd** | `VovaBarber.service` |
-| **Mode** | Long polling (webhook-ready later) |
+| **Mode** | Long polling |
+| **Slot step / duration** | **30 minutes** |
+| **Timezone** | Europe/Riga |
 
 ---
 
-## Client flow (current)
+## Client flow
 
-1. `/book` → **Today / Tomorrow / Day after / Other date**  
-   (blocked & vacation days hidden; **daily capacity limit is off**)
+1. **`/book`** → day (Today / Tomorrow / Day after / Other)  
+   - Blocked, vacation, or **no free slots** → label **(недоступно)** + alert on tap  
+   - **Today**: times already past + ~15 min lead are hidden  
 2. **Time slots** from Google Calendar **«Клиенты»**  
-   - Window: `CALENDAR_DEFAULT_START` … `CALENDAR_DAY_END` (default **08:30–21:00**)  
-   - Step / duration: **30 min** (configurable)  
-   - Any event on that calendar (bot **or manual**) occupies time  
-   - Slots sorted by **adjacency** (prefer next to existing clients)
-3. Choose **service** (or skip)
-4. Short **comment** (time already fixed by slot)
+   - Window **08:30–21:00** (env)  
+   - Step **30 min**; order **chronological** (08:30 → 09:00 → …)  
+   - Any event on that calendar (bot or manual) is **busy** — colour does not matter  
+3. **Service** (or skip)  
+4. Optional free-text comment **or** button **«Отправить без комментария»**  
 5. Request → admin group → ✅ / ❌  
+   - Under «Заявка отправлена» client sees **«Отозвать заявку»** until barber answers  
 
-Also: prices, history, contact, cancel, **reschedule** (same slot picker → barber must confirm).
+Also: prices, history, contact, cancel confirmed, reschedule (same slot flow → barber must confirm).
 
-Reminders: ~24h before + morning of the day (buttons; morning skipped if client already confirmed earlier).
+**Reminders:** ~24h before + morning of the day (buttons: confirm / think / cancel). Morning reminder is skipped if the client already confirmed on the 24h message.
+
+---
+
+## Pending vs confirmed
+
+| State | Storage | Client | Admin |
+|-------|---------|--------|-------|
+| **Pending** | `pending_bookings` | After send, before ✅ | Group card + **`/pending`** |
+| **Confirmed** | `confirmed_bookings` | Active visit | **`/bookings`**, Calendar event |
+| **Completed** | same, status `completed` | Past dates auto-archived | Hidden from `/bookings` |
+| **Cancelled** | `cancelled_by_*` | Not in active list | Stats |
+
+### `/pending` (admins)
+
+Works even if the group message was deleted.
+
+Per card:
+
+- ✅ Подтвердить / ❌ Отклонить  
+- 💬 Написать  
+- 🗑 Снять без ответа (remove from queue, no client message)
+
+### Client withdraw (before ✅)
+
+**«Отозвать заявку»** → pending removed, group notified (original card edited when `group_message_id` is stored).
+
+`/cancel` only aborts an **unfinished** wizard (not yet submitted).
+
+---
+
+## `/bookings` (admins)
+
+```text
+/bookings              all active (today + future)
+/bookings Иван         search name / contact / date / comment
+```
+
+- Shows **only today and future** confirmed bookings (Europe/Riga).  
+- Dates in the past are marked **completed** on bot start and on each list load — they leave the list and the active count.  
+- If none planned → «Активных записей нет.»  
+- Cards: name, contact nickname, date, comment, id  
+- Buttons: cancel this booking, write to client  
+- Pagination + optional bulk cancel  
+
+Cancel via bot also deletes the Calendar event when `calendar_event_id` exists.
+
+---
+
+## History (client)
+
+`/history` or menu **«История записей»**.
+
+- Filled when barber presses ✅ (`service_history`)  
+- Cancelled visits are not shown as active history  
+- Empty until the first confirmation  
 
 ---
 
@@ -37,65 +95,44 @@ Reminders: ~24h before + morning of the day (buttons; morning skipped if client 
 
 | Rule | Detail |
 |------|--------|
-| One calendar | Dedicated calendar ID in `.env` — **not** Family, not personal inbox clutter |
-| Bot writes | On ✅ confirm → green-ish event (`✂️`, ~30 min, start from slot) |
-| Bot deletes | On cancel when `calendar_event_id` stored |
-| Bot reads | **Every** slot offer (with short TTL cache ~45s); pagination via `pageToken` |
-| Manual events | Barber adds anything → that interval is **busy** for clients |
-| «Не работаю» | Optional label/colour; **any** event blocks the same way |
+| Bot writes (client) | On ✅ → event ~30 min from chosen slot |
+| Bot writes (block) | `/block`, `/vacation` → red all-day blocks |
+| Bot deletes | Cancel / unblock / unvacation when event id known |
+| Bot reads | Free slots; **any** event occupies time |
+| **Calendar → bot sync** | ~every 3 min (`CALENDAR_SYNC_INTERVAL_SEC`): delete event → cancel + notify client; move time/date → update booking + notify |
+| Manual-only events | Affect slots only; do **not** create bot client bookings |
 
-### `.env` (server)
+Sync applies to bookings that have `calendar_event_id` (confirmed after Calendar was connected).
+
+Diagnostics: **`/test_calendar`** and **`/test_calendar 02/10/2026`**.
+
+### `.env` (excerpt)
 
 ```env
 BOT_TOKEN=...
-ADMIN_IDS=1361872676,283788179
-ADMIN_GROUP_ID=-100...
-GOOGLE_CALENDAR_ID=...@group.calendar.google.com
-GOOGLE_CREDENTIALS_FILE=config/google_credentials.json
+ADMIN_IDS=...
+ADMIN_GROUP_ID=...
 TIMEZONE=Europe/Riga
 CALENDAR_DEFAULT_START=08:30
 CALENDAR_DAY_END=21:00
 CALENDAR_DEFAULT_DURATION_MIN=30
 CALENDAR_SLOT_STEP_MIN=30
 CALENDAR_SLOTS_CACHE_TTL=45
+CALENDAR_SLOT_LEAD_MIN=15
+CALENDAR_SYNC_INTERVAL_SEC=180
+GOOGLE_CALENDAR_ID=...@group.calendar.google.com
+GOOGLE_CREDENTIALS_FILE=config/google_credentials.json
 ```
 
-Setup guide: `docs/Google_Calendar_Setup.md`  
-Diagnostics: **`/test_calendar`** (admins) — read calendar + create/delete test event.
-
-Service account email must have **Make changes to events** on calendar «Клиенты».
+Guide: `docs/Google_Calendar_Setup.md`.
 
 ---
 
-## Adjacency scoring (slot order)
+## Stats / week (no capacity fraction)
 
-Free starts are generated every step from day start to day end, minus busy intervals from Calendar. Then sorted:
-
-| Priority | Score idea | Meaning |
-|----------|------------|---------|
-| Exactly **before** a client | +2000 | Slot ends when busy starts |
-| Exactly **after** a client | +2000 | Slot starts when busy ends |
-| Small hole ≤ duration | +1500 | Fill a one-client gap |
-| Near block ≤ 60 min | +800 | Still pack the day |
-| Distance penalty | small − | Prefer closer edges |
-| Empty day | score 0 | Earlier times first |
-
-Goal: avoid random holes (e.g. finish 15:00, next 17:00) by offering edges first. Barber still confirms in Telegram.
-
----
-
-## Admin group
-
-Buttons only for **ADMIN_IDS** (alert if someone else taps).
-
-| Button | Effect |
-|--------|--------|
-| ✅ | Confirm book or reschedule → Calendar event |
-| ❌ | Decline; optional suggest another time |
-| 💬 / 📝 | Open chat / save “name in contacts” |
-| ❌ cancel | After confirm (synced across messages) |
-
-Cancel text differs for client vs barber. Concurrent cancel is locked (RLock + file lock) and idempotent.
+- Old **`0/8`** style load is **removed** (Calendar owns capacity, not a fixed daily limit).  
+- Near days and `/week` show a plain count, or hide empty days (`Ближайшие дни: записей нет.`).  
+- Capacity limit is disabled for blocking new bookings (`is_day_full` always false).
 
 ---
 
@@ -103,20 +140,20 @@ Cancel text differs for client vs barber. Concurrent cancel is locked (RLock + f
 
 | Command | Purpose |
 |---------|---------|
-| `/admin` `/settings` | Prices, hours, welcome, reminders, blocks |
-| `/bookings` | Active list + cancel / write client |
-| `/pending` | Waiting accept/reject |
-| `/week` | Week overview |
-| `/stats` | Funnel-style counters |
-| `/block` `/unblock` `/vacation` `/unvacation` `/unblock_all` | Bot-side closed days (vacation message differs) |
-| `/cancel_id` `/edit_id` | Targeted admin ops |
-| `/backup` | Snapshot runtime YAML |
-| `/test_group` | Ping group |
-| `/test_calendar` | Google Calendar diagnostics |
+| `/admin` `/settings` | Prices, hours, welcome, reminders |
+| `/pending` | Queue + actions without group message |
+| `/bookings [query]` | Today+future confirmed |
+| `/week` `/stats` | Week load / funnel |
+| `/block` `/unblock` `/vacation` `/unvacation` `/unblock_all` | Close days + Calendar |
+| `/cancel_id` `/edit_id` | Targeted ops |
+| `/backup` | Snapshot `runtime_settings.yaml` |
+| `/test_group` `/test_calendar` | Diagnostics |
+
+Group ✅/❌ remain admin-only.
 
 ---
 
-## Deploy / update code
+## Deploy
 
 ```bash
 rsync -avz --exclude venv --exclude __pycache__ --exclude .git \
@@ -125,62 +162,30 @@ rsync -avz --exclude venv --exclude __pycache__ --exclude .git \
   ./ root@SERVER_IP:/opt/VovaBarber/
 
 ssh root@SERVER_IP 'systemctl restart VovaBarber'
-journalctl -u VovaBarber -n 40 --no-pager
 ```
 
-Never commit: `.env`, `google_credentials.json`, `runtime_settings.yaml`.
+Secrets stay on the server only. Unit: **`VovaBarber.service`**.
 
 ---
 
-## Security notes (ops)
+## Changelog (latest)
 
-- **Secrets**: only on server `config/.env` + JSON key; mode `600`; rsync excludes them.
-- **Admin**: commands and group callbacks gated by `ADMIN_IDS`.
-- **Callbacks**: business actions use `callback_data` + server checks; URL buttons only open chats/links.
-- **Group privacy**: prefer BotFather Group Privacy so the bot does not ingest all group chatter.
-- **Calendar**: service account limited to the shared «Клиенты» calendar.
-- **Token leak**: if BOT_TOKEN ever leaked → revoke in BotFather immediately.
-- **Conflict**: only **one** long-polling process (`TelegramConflictError` = second instance).
-
-### Load / concurrency
-
-Designed for a **small shop**, not a ticket flash-sale.
-
-| Scenario | Expectation |
-|----------|-------------|
-| Normal day (tens of clients) | Fine on CX22-class VPS |
-| ~100 clients **spread over time** | OK |
-| ~100 **simultaneous** `/book` | Will slow: each slot view hits Calendar (or 45s cache), YAML runtime under lock, single process |
-
-Mitigations if ever needed: longer slot cache, webhook + multi-worker (careful with shared YAML), move runtime to SQLite/Postgres, rate-limit `/book`.
-
-**3–5 s delay on `/book` after choosing a day is normal** when Calendar is cold (TLS + `events.list`). Warm cache (~45s) is faster. Network Riga↔Google dominates, not Telegram itself.
-
----
-
-## Stack
-
-- Python 3.12 venv, **aiogram 3**, long polling  
-- Runtime: YAML (`config/runtime_settings.yaml`) + optional `data/bot.db`  
-- Google Calendar API (service account)  
-- APScheduler-style reminder loop inside the bot process  
+- Slots **30 min**, **chronological** order; no adjacency chaos in the keyboard  
+- Capacity **`n/8` removed** from stats / week / group wording  
+- **`/bookings`**: only **today + future**; past → `completed` (Europe/Riga)  
+- Google Calendar read/write, `/test_calendar [date]`, block/vacation → Calendar  
+- **Calendar sync loop**: manual delete/move → client notification  
+- Day **(недоступно)** + smart today (lead time)  
+- **Send without comment** + **withdraw pending** before ✅  
+- **`/pending`** action buttons if group card is gone  
+- Welcome privacy not duplicated when set via `/settings`  
+- Reminders 24h + morning; reschedule like book  
 
 ---
 
 ## Partner pin (short)
 
-Clients write the bot, not phone. Requests land in the admin group.  
-Confirm / decline in one tap. Names + contact nicknames + last visit on the card.  
-Times come from calendar slots; what you put in **Клиенты** (including manual and «Не работаю») is busy.  
-Settings via `/settings`. Languages RU/LV for clients; group stays Russian.
-
----
-
-## Changelog (high level)
-
-- Google Calendar read/write, `/test_calendar`, dedicated «Клиенты» calendar  
-- Slot-based booking + adjacency packing; capacity-per-day disabled  
-- Reschedule uses the same slots  
-- Calendar list pagination; short TTL caches for slots & keyboards  
-- Admin-only group buttons; cancel/reschedule locking; reminders 24h + morning  
-- Deploy path `/opt/VovaBarber`, unit `VovaBarber.service`
+Clients book in the bot; requests land in the admin group. Confirm or decline in one tap.  
+Pending: `/pending`. Planned visits: `/bookings` (only upcoming).  
+What you put in calendar **Клиенты** blocks slots; moving or deleting a bot-created event updates the client.  
+Settings: `/settings`. Languages RU/LV for clients; group stays Russian.
