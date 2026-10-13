@@ -138,7 +138,9 @@ async def reminder_loop(bot: Bot):
     logger.info("Reminder loop started")
     while True:
         try:
-            await check_and_send(bot)
+            from src.services import settings_store as store
+            if store.reminders_enabled():
+                await check_and_send(bot)
         except Exception as e:
             logger.error(f"Reminder loop error: {e}")
         await asyncio.sleep(CHECK_INTERVAL_SEC)

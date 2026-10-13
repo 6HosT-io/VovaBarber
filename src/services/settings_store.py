@@ -113,6 +113,86 @@ def save_location(location: str):
     save_runtime(runtime)
 
 
+
+def get_phone() -> str:
+    runtime = get_runtime()
+    return (runtime.get("phone") or "+371 29985759").strip()
+
+
+def save_phone(phone: str):
+    runtime = get_runtime()
+    runtime["phone"] = (phone or "").strip()
+    save_runtime(runtime)
+
+
+def get_slot_settings() -> dict:
+    """Runtime overrides for slot window; fall back to env defaults in calendar."""
+    import os
+    runtime = get_runtime()
+    return {
+        "start": runtime.get("slot_day_start") or os.getenv("CALENDAR_DEFAULT_START", "08:30"),
+        "end": runtime.get("slot_day_end") or os.getenv("CALENDAR_DAY_END", "21:00"),
+        "step_min": int(runtime.get("slot_step_min") or os.getenv("CALENDAR_SLOT_STEP_MIN", "30")),
+        "duration_min": int(runtime.get("slot_duration_min") or os.getenv("CALENDAR_DEFAULT_DURATION_MIN", "30")),
+    }
+
+
+def save_slot_settings(start: str | None = None, end: str | None = None, step_min: int | None = None, duration_min: int | None = None):
+    runtime = get_runtime()
+    if start is not None:
+        runtime["slot_day_start"] = start.strip()
+    if end is not None:
+        runtime["slot_day_end"] = end.strip()
+    if step_min is not None:
+        runtime["slot_step_min"] = max(5, int(step_min))
+    if duration_min is not None:
+        runtime["slot_duration_min"] = max(5, int(duration_min))
+    save_runtime(runtime)
+
+
+def get_close_day_texts() -> dict:
+    runtime = get_runtime()
+    return {
+        "vacation_ru": runtime.get("text_vacation_ru") or "",
+        "vacation_lv": runtime.get("text_vacation_lv") or "",
+        "block_ru": runtime.get("text_block_ru") or "",
+        "block_lv": runtime.get("text_block_lv") or "",
+    }
+
+
+def save_close_day_text(kind: str, lang: str, text: str):
+    """kind: vacation|block, lang: ru|lv"""
+    runtime = get_runtime()
+    key = f"text_{kind}_{lang}"
+    runtime[key] = text
+    save_runtime(runtime)
+
+
+def reminders_enabled() -> bool:
+    runtime = get_runtime()
+    return bool(runtime.get("reminders_enabled", True))
+
+
+def set_reminders_enabled(on: bool):
+    runtime = get_runtime()
+    runtime["reminders_enabled"] = bool(on)
+    save_runtime(runtime)
+
+
+def get_calendar_sync_interval() -> int:
+    import os
+    runtime = get_runtime()
+    if runtime.get("calendar_sync_interval_sec") is not None:
+        return max(60, int(runtime["calendar_sync_interval_sec"]))
+    return max(60, int(os.getenv("CALENDAR_SYNC_INTERVAL_SEC", "180")))
+
+
+def save_calendar_sync_interval(sec: int):
+    runtime = get_runtime()
+    runtime["calendar_sync_interval_sec"] = max(60, int(sec))
+    save_runtime(runtime)
+
+
 def get_working_hours() -> dict:
     runtime = get_runtime()
     if "working_hours" in runtime:
@@ -591,49 +671,42 @@ def is_day_full(date_str: str) -> bool:
 def client_unavailable_message(date_str: str, lang: str = "ru") -> str:
     """Friendly text when day is closed (vacation vs simple block) or full."""
     reason = get_day_close_reason(date_str)
+    texts = get_close_day_texts()
+    until = get_vacation_end_for(date_str) or date_str
+    nl = chr(10)
     if reason == "vacation":
-        until = get_vacation_end_for(date_str) or date_str
+        custom = (texts.get(f"vacation_{lang}") or "").strip()
+        if custom:
+            return custom.replace("{until}", until).replace("{date}", date_str)
         if lang == "lv":
             return (
-                f"Paldies par interesi! 🙏\n\n"
-                f"Diemžēl līdz <b>{until}</b> esmu atpūtā / atvaļinājumā.\n"
+                f"Paldies par interesi! 🙏{nl}{nl}"
+                f"Diemžēl līdz <b>{until}</b> esmu atpūtā / atvaļinājumā.{nl}"
                 f"Tu vari pierakstīties uz datumu <b>pēc {until}</b> — "
-                f"tiklīdz būšu atpakaļ, apskatīšu pieteikumus.\n\n"
-                f"Uz drīzu tikšanos!\nTavs labākais bārddzinis ✂️"
+                f"tiklīdz būšu atpakaļ, apskatīšu pieteikumus.{nl}{nl}"
+                f"Uz drīzu tikšanos!{nl}Tavs labākais bārddzinis ✂️"
             )
         return (
-            f"Спасибо за интерес! 🙏\n\n"
-            f"К сожалению, до <b>{until}</b> я на отдыхе / в отпуске.\n"
+            f"Спасибо за интерес! 🙏{nl}{nl}"
+            f"К сожалению, до <b>{until}</b> я на отдыхе / в отпуске.{nl}"
             f"Можно записаться на дату <b>после {until}</b> — "
-            f"как вернусь, посмотрю заявки.\n\n"
-            f"До скорой встречи!\nВаш лучший барбер ✂️"
+            f"как вернусь, посмотрю заявки.{nl}{nl}"
+            f"До скорой встречи!{nl}Твой лучший барбер ✂️"
         )
-    if reason == "block":
-        if lang == "lv":
-            return (
-                f"Šī diena (<b>{date_str}</b>) nav pieejama pierakstam.\n"
-                f"Lūdzu, izvēlieties citu dienu."
-            )
-        return (
-            f"Этот день (<b>{date_str}</b>) недоступен для записи.\n"
-            f"Пожалуйста, выберите другой день."
-        )
-    # capacity full (not closed)
-    limit = get_max_bookings_per_day()
+    custom = (texts.get(f"block_{lang}") or "").strip()
+    if custom:
+        return custom.replace("{until}", until).replace("{date}", date_str)
     if lang == "lv":
         return (
-            f"Uz <b>{date_str}</b> jau ir pietiekami daudz pieteikumu "
-            f"(limits ~{limit}).\n"
-            f"Lūdzu, izvēlieties citu dienu vai rakstiet caur /contact."
+            f"Šajā dienā (<b>{date_str}</b>) pieraksts nav pieejams.{nl}"
+            f"Lūdzu, izvēlieties citu dienu."
         )
     return (
-        f"На <b>{date_str}</b> уже достаточно заявок "
-        f"(лимит ~{limit}).\n"
-        f"Пожалуйста, выберите другой день или напишите через /contact."
+        f"В этот день (<b>{date_str}</b>) запись недоступна.{nl}"
+        f"Выберите, пожалуйста, другой день."
     )
 
 
-# ---------- Pending bookings (for confirm → calendar) ----------
 
 def save_pending_booking(
     user_id: int,
@@ -696,6 +769,42 @@ def pop_pending_booking(user_id: int) -> dict | None:
     runtime["pending_bookings"] = pending
     save_runtime(runtime)
     return data
+
+
+def update_pending_booking(user_id: int, **fields) -> dict | None:
+    """Merge fields into existing pending booking. Returns updated dict or None."""
+    runtime = get_runtime()
+    pending = runtime.get("pending_bookings", {}) or {}
+    key = str(user_id)
+    if key not in pending or not isinstance(pending[key], dict):
+        return None
+    pending[key].update({k: v for k, v in fields.items() if v is not None})
+    runtime["pending_bookings"] = pending
+    save_runtime(runtime)
+    out = dict(pending[key])
+    out["user_id"] = key
+    return out
+
+
+def parse_suggestion_fields(text: str, fallback_date: str = "") -> dict:
+    """
+    From free-text suggestion extract optional DD/MM/YYYY and HH:MM
+    (any minutes, e.g. 11:20 — not only 30-min grid).
+    Returns {date, time, raw}.
+    """
+    import re
+    raw = (text or "").strip()
+    date_str = fallback_date or ""
+    time_str = ""
+    dm = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", raw)
+    if dm:
+        date_str = dm.group(1)
+    tm = re.search(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b", raw)
+    if tm:
+        time_str = f"{int(tm.group(1)):02d}:{tm.group(2)}"
+    return {"date": date_str, "time": time_str, "raw": raw}
+
+
 
 
 # ---------- Client service history ----------
@@ -891,6 +1000,9 @@ def add_confirmed_booking(
     date_str: str,
     comment: str,
     client_name: str = "",
+    service_id: str = "",
+    service_name: str = "",
+    extracted_time: str = "",
 ) -> str:
     runtime = get_runtime()
     bookings = runtime.get("confirmed_bookings", []) or []
@@ -901,6 +1013,9 @@ def add_confirmed_booking(
         "date": date_str,
         "comment": comment,
         "client_name": client_name,
+        "service_id": service_id or "",
+        "service_name": service_name or "",
+        "extracted_time": extracted_time or "",
         "status": "confirmed",
         "reminder_24h_sent": False,
         "reminder_morning_sent": False,

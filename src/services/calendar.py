@@ -761,10 +761,16 @@ def get_available_slots(
         if _time.time() - ts < _SLOTS_CACHE_TTL:
             return list(cached)
 
-    dur = duration_min if duration_min is not None else DEFAULT_DURATION_MIN
-    step = step_min if step_min is not None else SLOT_STEP_MIN
-    sh, sm = _parse_hhmm(day_start or DEFAULT_START)
-    eh, em = _parse_hhmm(day_end or DAY_END)
+    # Runtime overrides from /settings when present
+    try:
+        from src.services import settings_store as _store
+        ss = _store.get_slot_settings()
+    except Exception:
+        ss = {}
+    dur = duration_min if duration_min is not None else int(ss.get("duration_min") or DEFAULT_DURATION_MIN)
+    step = step_min if step_min is not None else int(ss.get("step_min") or SLOT_STEP_MIN)
+    sh, sm = _parse_hhmm(day_start or ss.get("start") or DEFAULT_START)
+    eh, em = _parse_hhmm(day_end or ss.get("end") or DAY_END)
     day_start_m = _minutes(sh, sm)
     day_end_m = _minutes(eh, em)
 

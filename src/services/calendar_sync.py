@@ -129,14 +129,18 @@ async def sync_once(bot: Bot) -> dict:
 
 
 async def calendar_sync_loop(bot: Bot):
-    logger.info(f"Calendar sync loop started (every {CHECK_INTERVAL_SEC}s)")
-    # small delay so bot is fully up
+    logger.info(f"Calendar sync loop started (default every {CHECK_INTERVAL_SEC}s)")
     await asyncio.sleep(20)
     while True:
+        try:
+            from src.services import settings_store as store
+            interval = store.get_calendar_sync_interval()
+        except Exception:
+            interval = CHECK_INTERVAL_SEC
         try:
             stats = await sync_once(bot)
             if stats.get("deleted") or stats.get("moved"):
                 logger.info(f"Calendar sync: {stats}")
         except Exception as e:
             logger.error(f"Calendar sync loop error: {e}")
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
+        await asyncio.sleep(interval)
