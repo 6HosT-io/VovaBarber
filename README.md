@@ -5,13 +5,13 @@ Bilingual Telegram bot for a **single-barber** shop in Riga.
 | | |
 |--|--|
 | **Address** | Jasmuižas iela 9, Latgales priekšpilsēta, Rīga, LV-1021 |
-| **Phone (in confirmations)** | +371 29985759 |
+| **Phone (in confirmations)** | Configurable via `/settings` (default +371 29985759) |
 | **Languages** | Russian (primary UI) + Latvian; admin group always Russian |
 | **Dates** | DD/MM/YYYY |
 | **Server path** | `/opt/VovaBarber` |
 | **systemd** | `VovaBarber.service` |
 | **Mode** | Long polling |
-| **Slot step / duration** | **30 minutes** |
+| **Slot step / duration** | **30 minutes** (overridable in `/settings`) |
 | **Timezone** | Europe/Riga |
 
 ---
@@ -20,19 +20,35 @@ Bilingual Telegram bot for a **single-barber** shop in Riga.
 
 1. **`/book`** → day (Today / Tomorrow / Day after / Other)  
    - Blocked, vacation, or **no free slots** → label **(недоступно)** + alert on tap  
-   - **Today**: times already past + ~15 min lead are hidden  
+   - **Today**: past times + ~15 min lead are hidden  
 2. **Time slots** from Google Calendar **«Клиенты»**  
-   - Window **08:30–21:00** (env)  
-   - Step **30 min**; order **chronological** (08:30 → 09:00 → …)  
+   - Default window **08:30–21:00** (env or `/settings` → окно слотов)  
+   - Step **30 min** by default; order **chronological**  
    - Any event on that calendar (bot or manual) is **busy** — colour does not matter  
 3. **Service** (or skip)  
-4. Optional free-text comment **or** button **«Отправить без комментария»**  
+4. Optional comment **or** **«Отправить без комментария»**  
 5. Request → admin group → ✅ / ❌  
-   - Under «Заявка отправлена» client sees **«Отозвать заявку»** until barber answers  
+   - Under «Заявка отправлена» client can **«Отозвать заявку»** until barber answers  
 
-Also: prices, history, contact, cancel confirmed, reschedule (same slot flow → barber must confirm).
+Also: prices, history, contact, cancel confirmed, reschedule (same slots → barber must confirm).
 
-**Reminders:** ~24h before + morning of the day (buttons: confirm / think / cancel). Morning reminder is skipped if the client already confirmed on the 24h message.
+**Reminders:** ~24h before + morning of the day (confirm / think / cancel). Morning skipped if client already confirmed on the 24h message. Toggleable in `/settings`.
+
+---
+
+## Accept, decline, suggest other time
+
+| Step | What happens |
+|------|----------------|
+| **✅ Подтвердить** | Client notified; confirmed booking; event in Calendar at slot time |
+| **❌ Отклонить** | Client notified; **pending ticket is kept** (same request) |
+| **📅 Предложить другое время** | Barber writes free text (e.g. `14/10/2026 в 11:20`) |
+| Client message | **«Барбер предлагает другое время:»** + text + **Принять** / **Не подходит** |
+| **Принять** | Group notified; booking confirmed; **Calendar uses exact HH:MM** (11:20 OK, not only :00/:30) |
+| **Не подходит** | Group: **Предложить ещё** / **Закрыть заявку**; client may write preferred windows in the bot chat |
+| **🗑 Закрыть заявку** | Pending removed; client told to use `/book` later |
+
+Phrase **«Сообщение от барбера»** is not used. Suggest text stays free-form; if `ЧЧ:ММ` and optional `ДД/ММ/ГГГГ` are present, they drive Calendar.
 
 ---
 
@@ -40,54 +56,36 @@ Also: prices, history, contact, cancel confirmed, reschedule (same slot flow →
 
 | State | Storage | Client | Admin |
 |-------|---------|--------|-------|
-| **Pending** | `pending_bookings` | After send, before ✅ | Group card + **`/pending`** |
-| **Confirmed** | `confirmed_bookings` | Active visit | **`/bookings`**, Calendar event |
-| **Completed** | same, status `completed` | Past dates auto-archived | Hidden from `/bookings` |
-| **Cancelled** | `cancelled_by_*` | Not in active list | Stats |
+| **Pending / rejected / suggested** | `pending_bookings` | Waiting or considering offer | Group card + **`/pending`** |
+| **Confirmed** | `confirmed_bookings` | Active visit | **`/bookings`**, Calendar |
+| **Completed** | past dates archived | — | Hidden from `/bookings` |
+| **Cancelled** | `cancelled_by_*` | — | Stats |
 
 ### `/pending` (admins)
 
-Works even if the group message was deleted.
+Works even if the group message was deleted. Cards show status (`pending` / `rejected` / `suggested`), optional last suggestion text, and actions (confirm / reject / write / clear).
 
-Per card:
+### Client withdraw (before first decision)
 
-- ✅ Подтвердить / ❌ Отклонить  
-- 💬 Написать  
-- 🗑 Снять без ответа (remove from queue, no client message)
-
-### Client withdraw (before ✅)
-
-**«Отозвать заявку»** → pending removed, group notified (original card edited when `group_message_id` is stored).
-
-`/cancel` only aborts an **unfinished** wizard (not yet submitted).
+**«Отозвать заявку»** → pending removed, group notified.  
+`/cancel` only aborts an unfinished wizard (not yet submitted).
 
 ---
 
 ## `/bookings` (admins)
 
 ```text
-/bookings              all active (today + future)
+/bookings              today + future confirmed
 /bookings Иван         search name / contact / date / comment
 ```
 
-- Shows **only today and future** confirmed bookings (Europe/Riga).  
-- Dates in the past are marked **completed** on bot start and on each list load — they leave the list and the active count.  
-- If none planned → «Активных записей нет.»  
-- Cards: name, contact nickname, date, comment, id  
-- Buttons: cancel this booking, write to client  
-- Pagination + optional bulk cancel  
-
-Cancel via bot also deletes the Calendar event when `calendar_event_id` exists.
+Past dates are marked **completed** (Europe/Riga) and leave the list. Empty → «Активных записей нет.»
 
 ---
 
 ## History (client)
 
-`/history` or menu **«История записей»**.
-
-- Filled when barber presses ✅ (`service_history`)  
-- Cancelled visits are not shown as active history  
-- Empty until the first confirmation  
+`/history` — visits after ✅. Cancelled items are not shown as active history.
 
 ---
 
@@ -95,14 +93,12 @@ Cancel via bot also deletes the Calendar event when `calendar_event_id` exists.
 
 | Rule | Detail |
 |------|--------|
-| Bot writes (client) | On ✅ → event ~30 min from chosen slot |
-| Bot writes (block) | `/block`, `/vacation` → red all-day blocks |
-| Bot deletes | Cancel / unblock / unvacation when event id known |
-| Bot reads | Free slots; **any** event occupies time |
-| **Calendar → bot sync** | ~every 3 min (`CALENDAR_SYNC_INTERVAL_SEC`): delete event → cancel + notify client; move time/date → update booking + notify |
-| Manual-only events | Affect slots only; do **not** create bot client bookings |
-
-Sync applies to bookings that have `calendar_event_id` (confirmed after Calendar was connected).
+| Bot writes (client) | On ✅ or client accepts a **suggestion** → event at slot / exact suggested time |
+| Bot writes (block) | `/block`, `/vacation` → red all-day |
+| Bot deletes | Cancel / unblock when event id known |
+| Bot reads | Free slots; any event = busy |
+| **Calendar → bot sync** | ~every 3 min (or interval from `/settings`): delete → cancel + notify; move → update + notify |
+| Manual-only events | Block slots only; do not create bot bookings |
 
 Diagnostics: **`/test_calendar`** and **`/test_calendar 02/10/2026`**.
 
@@ -128,11 +124,33 @@ Guide: `docs/Google_Calendar_Setup.md`.
 
 ---
 
-## Stats / week (no capacity fraction)
+## `/settings` (admins)
 
-- Old **`0/8`** style load is **removed** (Calendar owns capacity, not a fixed daily limit).  
-- Near days and `/week` show a plain count, or hide empty days (`Ближайшие дни: записей нет.`).  
-- Capacity limit is disabled for blocking new bookings (`is_day_full` always false).
+| Item | Purpose |
+|------|---------|
+| Цены и услуги | Service list / prices |
+| Рабочие часы (текст) | Info text for clients |
+| **Окно слотов** | Start / end / step / duration (e.g. `08:30 21:00 30 30`) |
+| Адрес | In confirmations |
+| **Телефон** | In confirmation messages |
+| Текст приветствия | `/start` RU/LV |
+| **Тексты отпуск / блок** | Client-facing; placeholders `{until}` `{date}` |
+| Тексты напоминаний | 24h / morning |
+| **Напоминания ВКЛ/ВЫКЛ** | Toggle reminder loop |
+| **Интервал Calendar sync** | Seconds (min 60) |
+| Заблокированные дни | View closed days |
+| Показать всё | Summary |
+
+Daily capacity limit UI is removed (Calendar owns capacity).
+
+---
+
+## Admin group behaviour
+
+- Bot **does not** treat normal group chatter or **voice** as client input.  
+- **«Имя в контактах»** accepts **text only** (not voice).  
+- Free-text from clients is forwarded only from **private** chat with the bot.  
+- ✅ / ❌ / suggest / close: **ADMIN_IDS only**.
 
 ---
 
@@ -140,8 +158,9 @@ Guide: `docs/Google_Calendar_Setup.md`.
 
 | Command | Purpose |
 |---------|---------|
-| `/admin` `/settings` | Prices, hours, welcome, reminders |
-| `/pending` | Queue + actions without group message |
+| `/admin` `/panel` | Full command list |
+| `/settings` | Runtime settings (see above) |
+| `/pending` | Queue + actions |
 | `/bookings [query]` | Today+future confirmed |
 | `/week` `/stats` | Week load / funnel |
 | `/block` `/unblock` `/vacation` `/unvacation` `/unblock_all` | Close days + Calendar |
@@ -149,7 +168,11 @@ Guide: `docs/Google_Calendar_Setup.md`.
 | `/backup` | Snapshot `runtime_settings.yaml` |
 | `/test_group` `/test_calendar` | Diagnostics |
 
-Group ✅/❌ remain admin-only.
+---
+
+## Stats / week
+
+No `0/8` capacity fractions. Counts only; empty near days may hide as «записей нет».
 
 ---
 
@@ -165,28 +188,30 @@ ssh root@SERVER_IP 'systemctl restart VovaBarber'
 journalctl -u VovaBarber -n 40 --no-pager
 ```
 
-Secrets stay on the server only. Unit: **`VovaBarber.service`**.
+Secrets stay on the server. Unit: **`VovaBarber.service`**.
 
 ---
 
 ## Changelog (latest)
 
-- Slots **30 min**, **chronological** order; no adjacency chaos in the keyboard  
-- Capacity **`n/8` removed** from stats / week / group wording  
-- **`/bookings`**: only **today + future**; past → `completed` (Europe/Riga)  
-- Google Calendar read/write, `/test_calendar [date]`, block/vacation → Calendar  
-- **Calendar sync loop**: manual delete/move → client notification  
-- Day **(недоступно)** + smart today (lead time)  
-- **Send without comment** + **withdraw pending** before ✅  
-- **`/pending`** action buttons if group card is gone  
-- Welcome privacy not duplicated when set via `/settings`  
-- Reminders 24h + morning; reschedule like book  
+- **Suggest other time**: after ❌ keep ticket → free-text offer → client Accept / Not suitable → Calendar at **exact HH:MM**  
+- Client copy: **«Барбер предлагает другое время:»** (not «Сообщение от барбера»)  
+- Close ticket / suggest again after client declines offer  
+- `/settings`: slot window, phone, vacation/block texts, reminders toggle, sync interval  
+- Slots chronological; capacity `n/8` removed  
+- `/bookings` today+future only; past → completed  
+- Calendar read/write + sync loop; `/test_calendar [date]`  
+- Day **(недоступно)** + smart today  
+- Send without comment + withdraw pending  
+- `/pending` with actions if group card deleted  
+- Group ignores voice for contact-name step  
 
 ---
 
 ## Partner pin (short)
 
-Clients book in the bot; requests land in the admin group. Confirm or decline in one tap.  
-Pending: `/pending`. Planned visits: `/bookings` (only upcoming).  
-What you put in calendar **Клиенты** blocks slots; moving or deleting a bot-created event updates the client.  
-Settings: `/settings`. Languages RU/LV for clients; group stays Russian.
+Клиенты пишут боту; заявки приходят в эту группу.  
+✅ подтвердить · ❌ отклонить · при отказе можно **предложить другое время** (клиент жмёт принять / не подходит).  
+Очередь: `/pending`. Ближайшие визиты: `/bookings`.  
+Календарь **Клиенты** блокирует слоты; точное время из предложения (в т.ч. 11:20) уходит в Calendar после принятия.  
+Настройки: `/settings`. Языки клиента RU/LV; группа на русском.
