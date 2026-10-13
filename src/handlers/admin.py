@@ -18,13 +18,17 @@ class EditStates(StatesGroup):
 
 
 class SettingsStates(StatesGroup):
-    edit_capacity = State()
+    edit_capacity = State()  # legacy unused
     edit_location = State()
     edit_prices = State()
     edit_hours = State()
     edit_welcome_ru = State()
     edit_welcome_lv = State()
     edit_reminder = State()
+    edit_phone = State()
+    edit_slots = State()
+    edit_close_text = State()
+    edit_sync_interval = State()
 
 
 def get_admin_ids() -> list[int]:
@@ -127,14 +131,21 @@ def validate_date_range(raw_start: str, raw_end: str):
 
 
 def settings_kb() -> InlineKeyboardMarkup:
+    from src.services import settings_store as store
+    rem_on = store.reminders_enabled()
+    rem_label = "🔔 Напоминания: ВКЛ" if rem_on else "🔔 Напоминания: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Цены и услуги", callback_data="set:prices")],
-        [InlineKeyboardButton(text="🕐 Рабочие часы", callback_data="set:hours")],
+        [InlineKeyboardButton(text="🕐 Рабочие часы (текст)", callback_data="set:hours")],
+        [InlineKeyboardButton(text="⏱ Окно слотов (начало/конец/шаг)", callback_data="set:slots")],
         [InlineKeyboardButton(text="📍 Адрес", callback_data="set:location")],
+        [InlineKeyboardButton(text="📞 Телефон в подтверждении", callback_data="set:phone")],
         [InlineKeyboardButton(text="👋 Текст приветствия", callback_data="set:welcome")],
+        [InlineKeyboardButton(text="🏖 Тексты отпуск / блок", callback_data="set:closetxt")],
         [InlineKeyboardButton(text="🔔 Тексты напоминаний", callback_data="set:reminders")],
+        [InlineKeyboardButton(text=rem_label, callback_data="set:rem_toggle")],
+        [InlineKeyboardButton(text="🔄 Интервал sync Calendar (сек)", callback_data="set:sync")],
         [InlineKeyboardButton(text="🔒 Заблокированные дни", callback_data="set:blocked")],
-        [InlineKeyboardButton(text="📊 Лимит заявок/день", callback_data="set:capacity")],
         [InlineKeyboardButton(text="📋 Показать всё", callback_data="set:show")],
     ])
 
@@ -147,18 +158,26 @@ async def cmd_admin(message: Message):
 
     text = (
         "🔧 <b>Admin panel</b>\n\n"
-        "Команды:\n"
-        "/admin /panel — это меню\n"
-        "/settings — настройки\n"
-        "/test_group — проверить группу\n"
-        "/block ДД/ММ/ГГГГ — один день\n"
-        "/unblock ДД/ММ/ГГГГ — один день\n"
-        "/vacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ — блок диапазона\n"
-        "/unvacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ — снять блок с диапазона\n"
-        "/unblock_all — снять все блокировки\n"
-        "/bookings — активные записи\n"
-        "/bookings имя — поиск по клиенту\n"
-        "/cancel_id ID — отмена по ID\n/stats — статистика использования\n\n"
+        "<b>Очередь и записи</b>\n"
+        "/pending — заявки без ✅/❌ (+ кнопки)\n"
+        "/bookings — активные (сегодня и дальше)\n"
+        "/bookings имя — поиск\n"
+        "/cancel_id ID — отмена подтверждённой\n"
+        "/edit_id ID — правка записи\n"
+        "/week — нагрузка недели\n"
+        "/stats — воронка и счётчики\n\n"
+        "<b>Дни и календарь</b>\n"
+        "/block ДД/ММ/ГГГГ\n"
+        "/unblock ДД/ММ/ГГГГ\n"
+        "/vacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ\n"
+        "/unvacation ДД/ММ/ГГГГ ДД/ММ/ГГГГ\n"
+        "/unblock_all — снять все блоки\n"
+        "/test_calendar [ДД/ММ/ГГГГ] — Google Calendar\n\n"
+        "<b>Настройки и сервис</b>\n"
+        "/settings — цены, часы, адрес, welcome…\n"
+        "/test_group — проверка admin-группы\n"
+        "/backup — снимок runtime\n"
+        "/admin /panel — это меню\n\n"
         f"Группа: <code>{get_admin_group() or '—'}</code>\n"
         f"Твой ID: <code>{message.from_user.id}</code>"
     )
@@ -1130,6 +1149,188 @@ async def cmd_week(message: Message):
     await message.answer(store.week_overview())
 
 
+
+@router.callback_query(F.data == "set:phone")
+async def settings_phone(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    cur = store.get_phone()
+    await state.set_state(SettingsStates.edit_phone)
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"📞 Текущий телефон в подтверждениях:{nl}<code>{cur}</code>{nl}{nl}"
+        f"Пришлите новый номер одним сообщением.{nl}/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_phone)
+async def save_phone_setting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=settings_kb())
+        return
+    from src.services import settings_store as store
+    store.save_phone((message.text or "").strip())
+    await state.clear()
+    await message.answer(f"✅ Телефон: <b>{store.get_phone()}</b>", reply_markup=settings_kb())
+
+
+@router.callback_query(F.data == "set:slots")
+async def settings_slots(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    ss = store.get_slot_settings()
+    await state.set_state(SettingsStates.edit_slots)
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"⏱ Окно слотов сейчас:{nl}"
+        f"начало <code>{ss['start']}</code>, конец <code>{ss['end']}</code>, "
+        f"шаг <code>{ss['step_min']}</code> мин, длительность <code>{ss['duration_min']}</code> мин{nl}{nl}"
+        f"Пришлите одной строкой:{nl}"
+        f"<code>08:30 21:00 30 30</code>{nl}"
+        f"(начало конец шаг_мин длительность_мин){nl}"
+        f"/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_slots)
+async def save_slots_setting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=settings_kb())
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Нужно минимум: начало и конец, например <code>08:30 21:00</code>")
+        return
+    from src.services import settings_store as store
+    start, end = parts[0], parts[1]
+    step = int(parts[2]) if len(parts) > 2 else None
+    dur = int(parts[3]) if len(parts) > 3 else None
+    store.save_slot_settings(start=start, end=end, step_min=step, duration_min=dur)
+    ss = store.get_slot_settings()
+    await state.clear()
+    await message.answer(
+        f"✅ Слоты: {ss['start']}–{ss['end']}, шаг {ss['step_min']}м, длит. {ss['duration_min']}м",
+        reply_markup=settings_kb(),
+    )
+
+
+@router.callback_query(F.data == "set:closetxt")
+async def settings_close_txt_menu(callback: CallbackQuery):
+    if not await require_admin_cb(callback):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏖 Отпуск RU", callback_data="set:ct:vacation:ru")],
+        [InlineKeyboardButton(text="🏖 Отпуск LV", callback_data="set:ct:vacation:lv")],
+        [InlineKeyboardButton(text="🔒 Блок RU", callback_data="set:ct:block:ru")],
+        [InlineKeyboardButton(text="🔒 Блок LV", callback_data="set:ct:block:lv")],
+        [InlineKeyboardButton(text="« Назад", callback_data="set:show")],
+    ])
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"Тексты, когда день недоступен.{nl}"
+        f"Плейсхолдеры: <code>{{until}}</code>, <code>{{date}}</code>.{nl}"
+        f"Пустой текст = стандартный шаблон.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set:ct:"))
+async def settings_close_txt_pick(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
+        return
+    parts = callback.data.split(":")
+    kind, lang = parts[2], parts[3]
+    from src.services import settings_store as store
+    texts = store.get_close_day_texts()
+    cur = texts.get(f"{kind}_{lang}") or "—"
+    await state.set_state(SettingsStates.edit_close_text)
+    await state.update_data(close_kind=kind, close_lang=lang)
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"Текущий ({kind}/{lang}):{nl}<code>{cur}</code>{nl}{nl}"
+        f"Пришлите новый текст одним сообщением.{nl}/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_close_text)
+async def save_close_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=settings_kb())
+        return
+    data = await state.get_data()
+    from src.services import settings_store as store
+    store.save_close_day_text(data.get("close_kind"), data.get("close_lang"), message.text or "")
+    await state.clear()
+    await message.answer("✅ Текст сохранён.", reply_markup=settings_kb())
+
+
+@router.callback_query(F.data == "set:rem_toggle")
+async def settings_rem_toggle(callback: CallbackQuery):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    store.set_reminders_enabled(not store.reminders_enabled())
+    on = store.reminders_enabled()
+    await callback.message.edit_text(
+        f"🔔 Напоминания клиентам: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>",
+        reply_markup=settings_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set:sync")
+async def settings_sync(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    cur = store.get_calendar_sync_interval()
+    await state.set_state(SettingsStates.edit_sync_interval)
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"🔄 Интервал опроса Calendar: <b>{cur}</b> сек (минимум 60).{nl}{nl}"
+        f"Пришлите число секунд.{nl}/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_sync_interval)
+async def save_sync_setting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=settings_kb())
+        return
+    try:
+        sec = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число, например 180")
+        return
+    from src.services import settings_store as store
+    store.save_calendar_sync_interval(sec)
+    await state.clear()
+    await message.answer(
+        f"✅ Sync каждые <b>{store.get_calendar_sync_interval()}</b> сек "
+        "(применится со следующего цикла).",
+        reply_markup=settings_kb(),
+    )
+
+
 @router.message(Command("pending"))
 async def cmd_pending(message: Message):
     """List pending with action buttons (works if group card was deleted)."""
@@ -1137,46 +1338,66 @@ async def cmd_pending(message: Message):
         return
     from src.services import settings_store as store
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    from loguru import logger
     import time
     items = store.list_pending_bookings()
     if not items:
         await message.answer("⏳ Нет заявок, ожидающих ответа.")
         return
     await message.answer(
-        f"⏳ <b>Ожидают ответа: {len(items)}</b>" + chr(10)
-        + "Кнопки ниже работают даже если сообщение в группе удалили."
+        f"⏳ <b>Ожидают ответа: {len(items)}</b>\n"
+        "Кнопки под каждой заявкой работают даже если сообщение в группе удалили."
     )
     now = time.time()
     for p in items:
-        uid = int(p.get("user_id"))
+        try:
+            uid = int(p.get("user_id"))
+        except (TypeError, ValueError):
+            logger.error(f"pending bad user_id: {p!r}")
+            continue
         age_h = ""
         if p.get("created_at"):
-            age_h = f" · {int((now - float(p['created_at'])) / 3600)}ч назад"
-        line = store.format_client_line(uid, p.get("client_name"), ref_date=p.get("date") or "")
-        nl = chr(10)
+            try:
+                age_h = f" · {int((now - float(p['created_at'])) / 3600)}ч назад"
+            except Exception:
+                pass
+        try:
+            line = store.format_client_line(uid, p.get("client_name"), ref_date=p.get("date") or "")
+        except Exception:
+            line = f"👤 {p.get('client_name') or uid}"
         text = (
-            f"{line}{nl}"
-            f"📅 {p.get('date')} · {p.get('service_name') or '—'} · {p.get('extracted_time') or ''}{nl}"
-            f"💬 {p.get('comment')}{age_h}{nl}"
-            f"kind={p.get('kind', 'book')}"
+            f"{line}\n"
+            f"📅 {p.get('date') or '—'} · {p.get('service_name') or '—'} · {p.get('extracted_time') or ''}\n"
+            f"💬 {p.get('comment') or '—'}{age_h}\n"
+            f"status={p.get('status') or 'pending'} · kind={p.get('kind', 'book')} · id={uid}"
+            + (f"\n💡 Предложение: {p.get('suggestion_text')}" if p.get("suggestion_text") else "")
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        rows = [
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:ok:{uid}"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:no:{uid}"),
             ],
-            [
-                InlineKeyboardButton(
-                    text="💬 Написать",
-                    url=store.client_chat_url(uid, None),
-                ),
-                InlineKeyboardButton(
-                    text="🗑 Снять без ответа",
-                    callback_data=f"pend:admin_clear:{uid}",
-                ),
-            ],
-        ])
-        await message.answer(text, reply_markup=kb)
+        ]
+        # URL button only with https://t.me/username — tg:// often fails API and kills the whole message
+        uname = store.get_client_username(uid)
+        write_row = []
+        if uname:
+            write_row.append(
+                InlineKeyboardButton(text="💬 Написать", url=f"https://t.me/{uname.lstrip('@')}")
+            )
+        write_row.append(
+            InlineKeyboardButton(text="🗑 Снять без ответа", callback_data=f"pend:admin_clear:{uid}")
+        )
+        rows.append(write_row)
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        try:
+            await message.answer(text, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"pending card send failed uid={uid}: {e}")
+            try:
+                await message.answer(text + f"\n\n⚠️ Кнопки не отправились: {e}")
+            except Exception:
+                pass
 
 
 @router.callback_query(F.data.startswith("pend:admin_clear:"))

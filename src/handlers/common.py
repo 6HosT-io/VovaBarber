@@ -1168,8 +1168,9 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             summary=summary,
             date_str=pending.get("date", ""),
             comment=pending.get("comment", ""),
-            duration_min=60,
+            duration_min=None,
             description=desc,
+            start_time=pending.get("extracted_time") or None,
         )
         if event_id:
             cal_note = "\n📅 Calendar обновлён"
@@ -1182,6 +1183,9 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             pending.get("date") or "",
             pending.get("comment") or "",
             client_name=pending.get("client_name") or "",
+            service_id=pending.get("service_id") or "",
+            service_name=pending.get("service_name") or "",
+            extracted_time=pending.get("extracted_time") or "",
         )
         store.add_service_history(
             client_id,
@@ -1203,8 +1207,9 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
             summary=summary,
             date_str=pending.get("date", ""),
             comment=pending.get("comment", ""),
-            duration_min=60,
+            duration_min=None,
             description=desc,
+            start_time=pending.get("extracted_time") or None,
         )
         if event_id:
             cal_note = "\n📅 Добавлено в Google Calendar"
@@ -1214,20 +1219,21 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
 
     try:
         location = store.get_location()
+        phone = store.get_phone()
         if is_reschedule:
             client_msg = (
                 f"✅ Перенос подтверждён!\n"
                 f"Новая дата: <b>{pending.get('date')}</b>\n"
                 f"💬 {pending.get('comment')}\n\n"
                 f"📍 {location}\n"
-                f"Если что-то случится: +371 29985759\n\n"
+                f"Если что-то случится: {phone}\n\n"
                 f"Отменить: /cancel_booking"
             )
         else:
             client_msg = (
                 f"✅ Ваша заявка подтверждена! Ждём вас.\n"
                 f"📍 {location}\n"
-                f"Если что-то случится, вот телефон: +371 29985759\n\n"
+                f"Если что-то случится, вот телефон: {phone}\n\n"
                 f"Отменить запись: /cancel_booking"
             )
         await bot.send_message(client_id, client_msg)
@@ -1255,42 +1261,86 @@ async def admin_confirm(callback: CallbackQuery, bot: Bot):
     await callback.answer("Клиент уведомлён")
 
 
+
 @router.callback_query(F.data.startswith("adm:no:"))
 async def admin_reject(callback: CallbackQuery, bot: Bot):
+    """Reject request but KEEP pending so barber can suggest another time (same ticket)."""
     if not await _ensure_admin_cb(callback):
         return
     client_id = int(callback.data.split(":")[2])
     from src.services import settings_store as store
-    pending = store.pop_pending_booking(client_id)
+    pending = store.get_pending_booking(client_id)
     is_reschedule = bool(pending and pending.get("kind") == "reschedule")
+
     try:
         if is_reschedule:
+            # transfer rejected — keep original confirmed booking
+            store.pop_pending_booking(client_id)
             await bot.send_message(
                 client_id,
                 "К сожалению, перенос на это время не можем принять.\n"
-                f"Старая запись на <b>{pending.get('old_date', '…')}</b> остаётся в силе.\n"
+                f"Старая запись на <b>{(pending or {}).get('old_date', '…')}</b> остаётся в силе.\n"
                 "Можно предложить другой слот через /reschedule или /book.",
             )
             footer = "\n\n❌ <b>Перенос отклонён</b> (старая запись сохранена)"
             await callback.message.edit_text(callback.message.text + footer)
         else:
+            if pending:
+                store.update_pending_booking(client_id, status="rejected")
+            else:
+                # nothing to keep — still notify
+                pass
             await bot.send_message(
                 client_id,
-                "К сожалению, эту заявку сейчас не можем принять. "
-                "Напишите другое время через /book — или дождитесь предложения от барбера.",
+                "К сожалению, это время сейчас не подходит.\n"
+                "Барбер может предложить другое — дождитесь сообщения в боте "
+                "или напишите удобные окна ответом сюда.",
             )
-            footer = "\n\n❌ <b>Отклонено</b>"
+            footer = "\n\n❌ <b>Отклонено</b> — можно предложить другое время"
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="📅 Предложить другое время",
                     callback_data=f"adm:suggest:{client_id}",
                 )],
+                [InlineKeyboardButton(
+                    text="🗑 Закрыть заявку",
+                    callback_data=f"adm:close_ticket:{client_id}",
+                )],
             ])
-            await callback.message.edit_text(callback.message.text + footer, reply_markup=kb)
+            await callback.message.edit_text(
+                callback.message.text + footer, reply_markup=kb
+            )
     except Exception as e:
         await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
     await callback.answer("Клиент уведомлён")
+
+
+@router.callback_query(F.data.startswith("adm:close_ticket:"))
+async def admin_close_ticket(callback: CallbackQuery, bot: Bot):
+    if not await _ensure_admin_cb(callback):
+        return
+    client_id = int(callback.data.split(":")[2])
+    from src.services import settings_store as store
+    store.pop_pending_booking(client_id)
+    try:
+        await bot.send_message(
+            client_id,
+            "Заявка закрыта. Когда будете готовы — снова /book.",
+        )
+    except Exception:
+        pass
+    try:
+        await callback.message.edit_text(
+            (callback.message.text or "") + "\n\n🗑 <b>Заявка закрыта</b>",
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await callback.answer("Закрыто")
 
 
 @router.callback_query(F.data.startswith("adm:suggest:"))
@@ -1298,17 +1348,32 @@ async def admin_suggest_start(callback: CallbackQuery, state: FSMContext):
     if not await _ensure_admin_cb(callback):
         return
     client_id = int(callback.data.split(":")[2])
+    from src.services import settings_store as store
+    pending = store.get_pending_booking(client_id)
+    hint = ""
+    if pending:
+        hint = (
+            f"\nИсходная заявка: {pending.get('date') or '—'} · "
+            f"{pending.get('extracted_time') or ''} · {pending.get('service_name') or ''}"
+        )
     await state.set_state(BookingStates.admin_suggest)
-    await state.update_data(suggest_user_id=client_id)
+    await state.update_data(
+        suggest_user_id=client_id,
+        suggest_group_msg_id=callback.message.message_id,
+        suggest_group_chat_id=callback.message.chat.id,
+    )
     await callback.message.answer(
-        "Напишите клиенту предложение (время/день) одним сообщением.\n"
-        "Пример: «Могу завтра после 15:00 или в пятницу утром»\n"
+        "Напишите предложение клиенту одним сообщением.\n"
+        "Можно свободный текст. Если укажете <b>ЧЧ:ММ</b> (даже 11:20) — "
+        "после принятия клиентом это время уйдёт в Calendar.\n"
+        "Пример: «Могу 14/10/2026 в 11:20» или «завтра после 15:00»\n"
+        f"{hint}\n"
         "/cancel — отмена"
     )
     await callback.answer()
 
 
-@router.message(BookingStates.admin_suggest)
+@router.message(BookingStates.admin_suggest, F.text)
 async def admin_suggest_send(message: Message, state: FSMContext, bot: Bot):
     if message.from_user.id not in _admin_ids():
         await state.clear()
@@ -1325,18 +1390,268 @@ async def admin_suggest_send(message: Message, state: FSMContext, bot: Bot):
         return
     text_out = (message.text or "").strip()
     if not text_out:
-        await message.answer("Пустое сообщение.")
+        await message.answer("Пустое сообщение — напишите текстом.")
         return
+
+    from src.services import settings_store as store
+    pending = store.get_pending_booking(int(uid))
+    fallback_date = (pending or {}).get("date") or ""
+    parsed = store.parse_suggestion_fields(text_out, fallback_date=fallback_date)
+
+    # Keep / restore pending ticket with suggestion
+    if pending:
+        store.update_pending_booking(
+            int(uid),
+            status="suggested",
+            suggestion_text=text_out,
+            suggested_date=parsed.get("date") or fallback_date,
+            suggested_time=parsed.get("time") or "",
+        )
+    else:
+        # recreate minimal pending so accept can confirm
+        store.save_pending_booking(
+            user_id=int(uid),
+            date_str=parsed.get("date") or fallback_date or "",
+            comment=text_out,
+            client_name="",
+            kind="book",
+            extracted_time=parsed.get("time") or "",
+        )
+        store.update_pending_booking(
+            int(uid),
+            status="suggested",
+            suggestion_text=text_out,
+            suggested_date=parsed.get("date") or "",
+            suggested_time=parsed.get("time") or "",
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять это время", callback_data=f"sug:ok:{uid}"),
+            InlineKeyboardButton(text="❌ Не подходит", callback_data=f"sug:no:{uid}"),
+        ],
+    ])
     try:
         await bot.send_message(
             int(uid),
-            f"✂️ Сообщение от барбера:\n\n{text_out}\n\n"
-            f"Записаться: /book",
+            f"<b>Барбер предлагает другое время:</b>\n\n{text_out}\n\n"
+            f"Нажмите кнопку ниже.",
+            reply_markup=kb,
         )
-        await message.answer("✅ Отправлено клиенту.")
+        note = ""
+        if parsed.get("time"):
+            note = f"\n⏱ Для Calendar распознано: <code>{parsed.get('date') or '—'} {parsed['time']}</code>"
+        await message.answer("✅ Предложение отправлено клиенту." + note)
     except Exception as e:
         await message.answer(f"Не удалось отправить: {e}")
 
+
+@router.message(BookingStates.admin_suggest)
+async def admin_suggest_nontext(message: Message):
+    if message.from_user and message.from_user.id not in _admin_ids():
+        return
+    await message.answer("Нужен текст предложения (не голос). /cancel — отмена")
+
+
+@router.callback_query(F.data.startswith("sug:ok:"))
+async def client_accept_suggestion(callback: CallbackQuery, bot: Bot):
+    """Client accepts barber's alternative time → confirm + Calendar with exact HH:MM."""
+    uid = int(callback.data.split(":")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("Это предложение не для вас.", show_alert=True)
+        return
+    from src.services import settings_store as store
+    from src.services import calendar as gcal
+
+    pending = store.get_pending_booking(uid)
+    if not pending or pending.get("status") not in ("suggested", "rejected", None, ""):
+        # still allow if status suggested or leftover
+        if not pending:
+            await callback.answer("Предложение уже не актуально.", show_alert=True)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+    pending = store.pop_pending_booking(uid) or pending
+    date_str = (
+        pending.get("suggested_date")
+        or pending.get("date")
+        or ""
+    )
+    time_str = (
+        pending.get("suggested_time")
+        or pending.get("extracted_time")
+        or ""
+    )
+    # re-parse from suggestion text if time missing
+    if not time_str and pending.get("suggestion_text"):
+        parsed = store.parse_suggestion_fields(
+            pending["suggestion_text"], fallback_date=date_str
+        )
+        time_str = parsed.get("time") or time_str
+        if parsed.get("date"):
+            date_str = parsed["date"]
+
+    comment_parts = []
+    if time_str:
+        comment_parts.append(time_str)
+    if pending.get("suggestion_text"):
+        comment_parts.append(pending["suggestion_text"])
+    elif pending.get("comment"):
+        comment_parts.append(pending["comment"])
+    comment = " · ".join(comment_parts) if comment_parts else (time_str or "—")
+
+    booking_id = store.add_confirmed_booking(
+        user_id=uid,
+        date_str=date_str,
+        comment=comment,
+        client_name=pending.get("client_name") or callback.from_user.full_name or "",
+        service_id=pending.get("service_id") or "",
+        service_name=pending.get("service_name") or "",
+        extracted_time=time_str or "",
+    )
+    store.add_service_history(
+        uid,
+        pending.get("service_name") or "визит",
+        date_str=date_str,
+        booking_id=booking_id or "",
+    )
+    store.track_event("booking_confirmed", uid)
+
+    cal_note = ""
+    event_id = None
+    if gcal.is_configured() and date_str:
+        name = pending.get("client_name") or callback.from_user.full_name or "Клиент"
+        contact = store.get_client_contact_name(uid)
+        svc = pending.get("service_name") or ""
+        summary = f"{contact or name}" + (f" — {svc}" if svc else "")
+        desc = (
+            f"Telegram: {name}\n"
+            f"Предложение барбера: {pending.get('suggestion_text') or ''}\n"
+            f"Дата: {date_str} {time_str}"
+        )
+        event_id = gcal.create_event(
+            summary=summary,
+            date_str=date_str,
+            comment=comment,
+            duration_min=None,
+            description=desc,
+            start_time=time_str or None,  # exact HH:MM override incl. 11:20
+        )
+        if event_id:
+            cal_note = "\n📅 В Google Calendar"
+            store.update_booking(booking_id, calendar_event_id=event_id)
+        else:
+            cal_note = "\n⚠️ Calendar: не создалось (проверьте дату/доступ)"
+
+    location = store.get_location()
+    phone = store.get_phone()
+    try:
+        await callback.message.edit_text(
+            (callback.message.text or "") + "\n\n✅ <b>Вы приняли это время. Ждём вас!</b>"
+        )
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            uid,
+            f"✅ Запись подтверждена на предложенное время.\n"
+            f"📅 <b>{date_str or '—'}</b>"
+            + (f" · <b>{time_str}</b>" if time_str else "")
+            + f"\n📍 {location}\n"
+            f"Если что-то случится: {phone}\n\n"
+            f"Отменить: /cancel_booking",
+        )
+    except Exception:
+        pass
+
+    # notify admin group
+    group = None
+    try:
+        import os
+        group = os.getenv("ADMIN_GROUP_ID")
+    except Exception:
+        group = None
+    if group:
+        line = store.format_client_line(uid, pending.get("client_name") or callback.from_user.full_name, ref_date=date_str)
+        kb = None
+        if booking_id:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❌ Отменить эту запись",
+                    callback_data=f"adm:cancel:{booking_id}",
+                )],
+            ])
+        try:
+            await bot.send_message(
+                group,
+                f"✅ Клиент <b>принял</b> предложенное время\n"
+                f"{line}\n"
+                f"📅 {date_str or '—'} · {time_str or '—'}\n"
+                f"💬 {pending.get('suggestion_text') or comment}"
+                f"{cal_note}",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"suggest accept group notify: {e}")
+
+    await callback.answer("Принято")
+
+
+@router.callback_query(F.data.startswith("sug:no:"))
+async def client_reject_suggestion(callback: CallbackQuery, bot: Bot):
+    uid = int(callback.data.split(":")[2])
+    if callback.from_user.id != uid:
+        await callback.answer("Это предложение не для вас.", show_alert=True)
+        return
+    from src.services import settings_store as store
+    pending = store.get_pending_booking(uid)
+    if pending:
+        store.update_pending_booking(uid, status="rejected")
+    try:
+        await callback.message.edit_text(
+            (callback.message.text or "")
+            + "\n\n❌ Вы отклонили предложение.\n"
+            "Можете написать сюда удобные окна — барбер увидит. "
+            "Или дождаться нового предложения."
+        )
+    except Exception:
+        pass
+
+    group = None
+    try:
+        import os
+        group = os.getenv("ADMIN_GROUP_ID")
+    except Exception:
+        group = None
+    if group:
+        name = (pending or {}).get("client_name") or callback.from_user.full_name or str(uid)
+        line = store.format_client_line(uid, name)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📅 Предложить ещё раз",
+                callback_data=f"adm:suggest:{uid}",
+            )],
+            [InlineKeyboardButton(
+                text="🗑 Закрыть заявку",
+                callback_data=f"adm:close_ticket:{uid}",
+            )],
+        ])
+        try:
+            await bot.send_message(
+                group,
+                f"❌ Клиент <b>не принял</b> предложенное время\n"
+                f"{line}\n"
+                f"Было: {(pending or {}).get('suggestion_text') or '—'}\n\n"
+                f"Можно предложить снова или закрыть заявку.",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"suggest reject group notify: {e}")
+
+    await callback.answer("Отклонено")
 
 
 async def _clear_group_cancel_button(
@@ -1470,7 +1785,7 @@ async def admin_setname_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(BookingStates.waiting_contact_name)
+@router.message(BookingStates.waiting_contact_name, F.text)
 async def admin_setname_save(message: Message, state: FSMContext):
     if message.from_user.id not in _admin_ids():
         await state.clear()
@@ -1498,6 +1813,19 @@ async def admin_setname_save(message: Message, state: FSMContext):
         f"📱 В контактах: <b>{name}</b>"
     )
 
+
+
+
+@router.message(BookingStates.waiting_contact_name)
+async def admin_setname_nontext(message: Message, state: FSMContext):
+    """Ignore voice/photo/stickers while waiting for contact name."""
+    if message.from_user and message.from_user.id not in _admin_ids():
+        await state.clear()
+        return
+    await message.answer(
+        "Нужен <b>текст</b> (имя в контактах). Голосовые и файлы не принимаются."
+        + chr(10) + "/cancel — отмена"
+    )
 
 
 # ---------- Reminder buttons ----------
