@@ -98,7 +98,9 @@ async def on_startup():
     await set_bot_commands(bot)
     # Background reminders (24h + morning)
     from src.services.reminders import reminder_loop
+    from src.services.calendar_sync import calendar_sync_loop
     asyncio.create_task(reminder_loop(bot))
+    asyncio.create_task(calendar_sync_loop(bot))
     logger.info("Bot started successfully (reminders loop on)")
 
 
