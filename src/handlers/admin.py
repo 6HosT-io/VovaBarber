@@ -1331,6 +1331,84 @@ async def save_sync_setting(message: Message, state: FSMContext):
     )
 
 
+
+@router.message(Command("vip_add"))
+async def cmd_vip_add(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: <code>/vip_add TELEGRAM_ID</code>")
+        return
+    uid = int(parts[1])
+    added = store.add_vip(uid)
+    await message.answer(
+        f"✅ VIP добавлен: <code>{uid}</code>" if added else f"Уже VIP: <code>{uid}</code>"
+    )
+
+
+@router.message(Command("vip_del"))
+async def cmd_vip_del(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: <code>/vip_del TELEGRAM_ID</code>")
+        return
+    uid = int(parts[1])
+    ok = store.remove_vip(uid)
+    await message.answer(
+        f"VIP снят: <code>{uid}</code>" if ok else f"Не был VIP: <code>{uid}</code>"
+    )
+
+
+@router.message(Command("vip_list"))
+async def cmd_vip_list(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    ids = sorted(store.get_vip_ids())
+    if not ids:
+        await message.answer("VIP-список пуст.")
+        return
+    lines = chr(10).join(f"• <code>{i}</code>" for i in ids)
+    await message.answer(f"<b>VIP ({len(ids)})</b>" + chr(10) + lines)
+
+
+@router.message(Command("away_banner"))
+async def cmd_away_banner(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from src.services import settings_store as store
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) == 1:
+        on = store.away_banner_enabled()
+        sample = store.format_away_banner("ru") or "—"
+        nl = chr(10)
+        await message.answer(
+            f"Баннер отпуска/блока: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>{nl}"
+            f"Сейчас:{nl}{sample}{nl}{nl}"
+            f"/away_banner on|off{nl}"
+            f"/away_banner ru текст…{nl}"
+            f"/away_banner lv текст…"
+        )
+        return
+    arg = parts[1].lower()
+    if arg in ("on", "off", "1", "0", "вкл", "выкл"):
+        store.set_away_banner_enabled(arg in ("on", "1", "вкл"))
+        await message.answer(
+            f"Баннер: <b>{'ВКЛ' if store.away_banner_enabled() else 'ВЫКЛ'}</b>"
+        )
+        return
+    if arg in ("ru", "lv") and len(parts) >= 3:
+        store.save_away_banner_text(arg, parts[2])
+        await message.answer(f"Текст баннера ({arg}) сохранён.")
+        return
+    await message.answer("Синтаксис: /away_banner on|off | /away_banner ru|lv текст")
+
+
 @router.message(Command("pending"))
 async def cmd_pending(message: Message):
     """List pending with action buttons (works if group card was deleted)."""

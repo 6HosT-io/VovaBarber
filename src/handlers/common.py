@@ -179,13 +179,24 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer_photo(photo=photo, caption=caption, reply_markup=main_menu_kb(lang))
     else:
         await message.answer(caption, reply_markup=main_menu_kb(lang))
+    try:
+        from src.services import settings_store as store
+        banner = store.format_away_banner(lang)
+        if banner:
+            await message.answer(banner)
+    except Exception:
+        pass
 
 
 
-async def _deny_if_closed_or_full(message_or_cb, date_str: str, lang: str, *, as_callback: bool) -> bool:
-    """Return True if day is blocked/vacation (capacity limit disabled)."""
+async def _deny_if_closed_or_full(
+    message_or_cb, date_str: str, lang: str, *, as_callback: bool, user_id: int | None = None
+) -> bool:
+    """Return True if day is blocked/vacation for this user. VIP may pass (request for review)."""
     from src.services import settings_store as store
     if not store.is_blocked(date_str):
+        return False
+    if user_id and store.is_vip(user_id):
         return False
     msg = store.client_unavailable_message(date_str, lang)
     if as_callback:
@@ -196,36 +207,52 @@ async def _deny_if_closed_or_full(message_or_cb, date_str: str, lang: str, *, as
     return True
 
 
-async def _offer_slots(target, state: FSMContext, date_str: str, lang: str, *, edit: bool):
-    """Fetch calendar and show free slots (adjacency-sorted)."""
+async def _offer_slots(target, state: FSMContext, date_str: str, lang: str, *, edit: bool, user_id: int | None = None):
+    """Show free slots; VIP also sees busy slots marked ⭐ (normals never see stars)."""
     from src.services import calendar as gcal
-    slots = gcal.get_available_slots(date_str)
+    from src.services import settings_store as store
+    vip = bool(user_id and store.is_vip(user_id))
+    if vip:
+        grid = gcal.get_slot_grid(date_str, include_busy=True)
+        slots = [t for t, _ in grid]
+        busy_slots = [t for t, busy in grid if busy]
+    else:
+        slots = gcal.get_available_slots(date_str)
+        busy_slots = []
     if not slots:
+        nl = chr(10)
         text = (
-            f"На <b>{date_str}</b> свободных окон нет (календарь занят или вне рабочих часов).\n"
+            f"На <b>{date_str}</b> свободных окон нет (календарь занят или вне рабочих часов).{nl}"
             f"Выберите другой день."
             if lang == "ru"
-            else f"<b>{date_str}</b> — nav brīvu laiku.\nIzvēlieties citu dienu."
+            else f"<b>{date_str}</b> — nav brīvu laiku.{nl}Izvēlieties citu dienu."
         )
+        kb = day_selection_kb(lang, vip=vip)
         if edit:
-            await target.edit_text(text, reply_markup=day_selection_kb(lang))
+            await target.edit_text(text, reply_markup=kb)
         else:
-            await target.answer(text, reply_markup=day_selection_kb(lang))
+            await target.answer(text, reply_markup=kb)
         return False
-    await state.update_data(date=date_str, slot=None)
+    await state.update_data(date=date_str, slot=None, vip=vip, day_closed=store.is_blocked(date_str))
     await state.set_state(BookingStates.waiting_slot)
-    text = (
-        f"Дата: <b>{date_str}</b>\nВыберите свободное время\n"
-        f"<i>Сначала окна рядом с уже стоящими клиентами</i>"
-        if lang == "ru"
-        else f"Datums: <b>{date_str}</b>\nIzvēlieties brīvo laiku"
-    )
-    markup = slot_selection_kb(slots, lang)
+    nl = chr(10)
+    if lang == "ru":
+        text = f"Дата: <b>{date_str}</b>{nl}Выберите время"
+        if vip and busy_slots:
+            text += f"{nl}<i>⭐ — уже занято в календаре; VIP может запросить это окно на рассмотрение</i>"
+        if store.is_blocked(date_str) and vip:
+            text += f"{nl}<i>День закрыт для обычной записи — заявка уйдёт барберу на ревью</i>"
+    else:
+        text = f"Datums: <b>{date_str}</b>{nl}Izvēlieties laiku"
+        if vip and busy_slots:
+            text += f"{nl}<i>⭐ — aizņemts; VIP var nosūtīt pieprasījumu</i>"
+    markup = slot_selection_kb(slots, lang, busy_slots=busy_slots if vip else None)
     if edit:
         await target.edit_text(text, reply_markup=markup)
     else:
         await target.answer(text, reply_markup=markup)
     return True
+
 
 # ---------- Book ----------
 
@@ -234,8 +261,13 @@ async def _offer_slots(target, state: FSMContext, date_str: str, lang: str, *, e
 async def cmd_book(message: Message, state: FSMContext):
     await state.clear()
     lang = get_lang(message)
+    from src.services import settings_store as store
+    vip = store.is_vip(message.from_user.id)
+    banner = store.format_away_banner(lang)
+    if banner:
+        await message.answer(banner)
     text = "Выберите день:" if lang == "ru" else "Izvēlieties dienu:"
-    await message.answer(text, reply_markup=day_selection_kb(lang))
+    await message.answer(text, reply_markup=day_selection_kb(lang, vip=vip))
 
 
 async def _apply_reschedule_day(callback: CallbackQuery, state: FSMContext, day_key: str):
@@ -322,11 +354,14 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
         return
 
     date_str = resolve_date(day_key)
-    if await _deny_if_closed_or_full(callback, date_str, lang, as_callback=True):
+    uid = callback.from_user.id if callback.from_user else None
+    if await _deny_if_closed_or_full(callback, date_str, lang, as_callback=True, user_id=uid):
         return
     from src.services import calendar as gcal
+    from src.services import settings_store as store
     ok, reason = gcal.day_is_bookable(date_str)
-    if not ok:
+    vip = bool(uid and store.is_vip(uid))
+    if not ok and not vip:
         if lang == "ru":
             msg = (
                 "На сегодня окон уже нет." if reason == "past"
@@ -337,8 +372,8 @@ async def process_day(callback: CallbackQuery, state: FSMContext):
         await callback.answer(msg, show_alert=True)
         return
 
-    await state.update_data(day_key=day_key, date=date_str)
-    await _offer_slots(callback.message, state, date_str, lang, edit=True)
+    await state.update_data(day_key=day_key, date=date_str, day_closed=store.is_blocked(date_str))
+    await _offer_slots(callback.message, state, date_str, lang, edit=True, user_id=uid)
     await callback.answer()
 
 
@@ -358,11 +393,13 @@ async def process_custom_date(message: Message, state: FSMContext):
         return
 
     date_str = to_display(parsed)
-    if await _deny_if_closed_or_full(message, date_str, lang, as_callback=False):
+    uid = message.from_user.id if message.from_user else None
+    if await _deny_if_closed_or_full(message, date_str, lang, as_callback=False, user_id=uid):
         return
 
-    await state.update_data(day_key="other", date=date_str)
-    await _offer_slots(message, state, date_str, lang, edit=False)
+    from src.services import settings_store as store
+    await state.update_data(day_key="other", date=date_str, day_closed=store.is_blocked(date_str))
+    await _offer_slots(message, state, date_str, lang, edit=False, user_id=uid)
 
 
 
@@ -392,16 +429,21 @@ async def process_slot(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     date_str = data.get("date") or data.get("reschedule_date") or ""
     from src.services import calendar as gcal
+    from src.services import settings_store as store
+    vip = store.is_vip(callback.from_user.id)
     free = gcal.get_available_slots(date_str, use_cache=False)
-    if slot not in free:
+    slot_busy = slot not in free
+    if slot_busy and not vip:
         await callback.answer(
             "Это время уже занято, выберите другое" if lang == "ru" else "Laiks aizņemts",
             show_alert=True,
         )
-        await _offer_slots(callback.message, state, date_str, lang, edit=True)
+        await _offer_slots(
+            callback.message, state, date_str, lang, edit=True, user_id=callback.from_user.id
+        )
         return
 
-    await state.update_data(slot=slot)
+    await state.update_data(slot=slot, slot_busy=slot_busy)
     if is_reschedule:
         await state.update_data(reschedule_date=date_str)
         await state.set_state(BookingStates.reschedule_comment)
@@ -425,7 +467,8 @@ async def process_slot(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(BookingStates.waiting_service, F.data.startswith("svc:"))
-async def process_service(callback: CallbackQuery, state: FSMContext):
+async def process_service(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Listed service → send request immediately. Skip → one line custom service name then send."""
     lang_code = (callback.from_user.language_code or "ru").lower()
     lang = "lv" if lang_code.startswith("lv") else "ru"
     from src.services import settings_store as store
@@ -438,31 +481,25 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
             service_id = sid
             service_name = svc.get("name_ru") if lang == "ru" else svc.get("name_lv")
             service_name = service_name or sid
-    await state.update_data(service_id=service_id, service_name=service_name or "")
-    await state.set_state(BookingStates.waiting_comment)
-    data = await state.get_data()
-    date_str = data.get("date", "")
-    slot = data.get("slot") or ""
-    parts = []
-    if service_name:
-        parts.append(
-            ("Услуга: <b>%s</b>" if lang == "ru" else "Pakalpojums: <b>%s</b>") % service_name
+        await state.update_data(service_id=service_id, service_name=service_name or "")
+        await callback.answer()
+        await _finish_booking_request(
+            callback.from_user,
+            state,
+            bot,
+            raw_comment="",
+            reply_target=callback.message,
+            lang=lang,
         )
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    if lang == "ru":
-        parts.append("Дата: <b>%s</b> · <b>%s</b>" % (date_str, slot))
-        parts.append("")
-        parts.append("Можно добавить комментарий барберу — или отправить заявку сразу.")
-        skip_label = "✅ Отправить без комментария"
-    else:
-        parts.append("Datums: <b>%s</b> · <b>%s</b>" % (date_str, slot))
-        parts.append("")
-        parts.append("Var pievienot komentāru — vai nosūtīt pieteikumu uzreiz.")
-        skip_label = "✅ Nosūtīt bez komentāra"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=skip_label, callback_data="comment:skip")]]
+        return
+    # Custom / skip: short text for service only (not a free comment step)
+    await state.update_data(service_id="", service_name="")
+    await state.set_state(BookingStates.waiting_comment)
+    await callback.message.edit_text(
+        "Напишите услугу одним сообщением (или «-» чтобы без названия):"
+        if lang == "ru"
+        else "Uzrakstiet pakalpojumu vienā ziņā (vai «-» bez nosaukuma):"
     )
-    await callback.message.edit_text(chr(10).join(parts), reply_markup=kb)
     await callback.answer()
 
 
@@ -484,7 +521,7 @@ async def _finish_booking_request(user, state: FSMContext, bot: Bot, *, raw_comm
     service_name = data.get("service_name") or ""
     from src.services import settings_store as store
 
-    if store.is_blocked(date_str):
+    if store.is_blocked(date_str) and not store.is_vip(user.id):
         await state.clear()
         await reply_target.answer(
             store.client_unavailable_message(date_str, lang),
@@ -495,23 +532,26 @@ async def _finish_booking_request(user, state: FSMContext, bot: Bot, *, raw_comm
     await state.clear()
     extracted = slot or store.extract_time_hint(comment)
     day_name = day_label(day_key, lang)
-    svc_line = ("\nУслуга: <b>%s</b>" % service_name) if service_name else ""
-    time_line = ("\nВремя: <b>%s</b>" % extracted) if extracted else ""
     nl = chr(10)
+    svc_line = f"{nl}Услуга: <b>{service_name}</b>" if service_name else ""
+    time_line = f"{nl}Время: <b>{extracted}</b>" if extracted else ""
     if lang == "ru":
         client_text = (
             f"✅ Заявка отправлена!{nl}{nl}"
             f"День: <b>{day_name}</b> ({date_str})"
-            + svc_line.replace("\\n", nl).replace("\n", nl)
-            + time_line.replace("\\n", nl).replace("\n", nl)
-            + f"{nl}Комментарий: {comment or '—'}{nl}{nl}"
-            f"Барбер скоро подтвердит или предложит другое время."
+            + svc_line
+            + time_line
+            + f"{nl}{nl}Барбер скоро подтвердит или предложит другое время."
         )
     else:
+        svc_lv = f"{nl}Pakalpojums: <b>{service_name}</b>" if service_name else ""
+        time_lv = f"{nl}Laiks: <b>{extracted}</b>" if extracted else ""
         client_text = (
             f"✅ Pieprasījums nosūtīts!{nl}{nl}"
-            f"Diena: <b>{day_name}</b> ({date_str}){nl}"
-            f"Komentārs: {comment or '—'}"
+            f"Diena: <b>{day_name}</b> ({date_str})"
+            + svc_lv
+            + time_lv
+            + f"{nl}{nl}Bārddzinis drīz apstiprinās vai piedāvās citu laiku."
         )
     withdraw_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -524,16 +564,27 @@ async def _finish_booking_request(user, state: FSMContext, bot: Bot, *, raw_comm
 
     if ADMIN_GROUP_ID:
         client_line = store.format_client_line(user.id, user.full_name, ref_date=date_str)
+        vip = store.is_vip(user.id)
+        slot_busy = bool(data.get("slot_busy"))
+        day_closed = bool(data.get("day_closed") or store.is_blocked(date_str))
+        # Minimal VIP mark: only when override (busy slot or closed day) — no clutter for normal VIP visits
+        override = vip and (slot_busy or day_closed)
+        title = "🆕 <b>Новая заявка</b>"
+        if override:
+            title = "🆕 <b>Новая заявка</b> · <b>VIP</b> (исключение)"
         group_text = (
-            f"🆕 <b>Новая заявка</b>{nl}{nl}"
+            f"{title}{nl}{nl}"
             f"{client_line}{nl}"
             f"📅 День: <b>{day_label(day_key, 'ru')}</b> ({date_str}){nl}"
         )
         if service_name:
             group_text += f"✂️ Услуга: <b>{service_name}</b>{nl}"
         if extracted:
-            group_text += f"🕐 Время: <b>{extracted}</b>{nl}"
-        group_text += f"💬 Комментарий: {comment or '—'}"
+            mark = " ⚠️ занято в Calendar" if slot_busy else ""
+            group_text += f"🕐 Время: <b>{extracted}</b>{mark}{nl}"
+        if day_closed:
+            group_text += f"🔒 День закрыт (блок/отпуск) — только на ревью{nl}"
+        # No separate comment line: slot + service already cover the request
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"adm:ok:{user.id}"),
@@ -601,13 +652,18 @@ async def process_comment_skip(callback: CallbackQuery, state: FSMContext, bot: 
 
 @router.message(BookingStates.waiting_comment)
 async def process_comment(message: Message, state: FSMContext, bot: Bot):
+    """Only used after «Пропустить / свой текст» — text becomes service name, then send."""
     lang = get_lang(message)
     raw = (message.text or "").strip()
+    if raw in ("", "—", "-"):
+        await state.update_data(service_name="", service_id="")
+    else:
+        await state.update_data(service_name=raw, service_id="")
     await _finish_booking_request(
         message.from_user,
         state,
         bot,
-        raw_comment=raw,
+        raw_comment="",
         reply_target=message,
         lang=lang,
     )
