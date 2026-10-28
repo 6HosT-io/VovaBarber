@@ -1135,27 +1135,43 @@ async def cmd_contact(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     lang = get_lang(message)
+    nl = chr(10)
     if lang == "ru":
         text = (
-            "Команды:\n"
-            "/start — меню\n"
-            "/book — записаться\n"
-            "/prices — цены\n"
-            "/history — история\n"
-            "/contact — связаться\n"
-            "/cancel — отменить текущее действие\n"
-            "/help — справка"
+            f"<b>Помощь — запись к барберу</b>{nl}{nl}"
+            f"<b>Как записаться</b>{nl}"
+            f"1. /book или кнопка «Записаться»{nl}"
+            f"2. День → время → услуга{nl}"
+            f"3. Заявка уходит барберу; ждите ✅ или другое время{nl}{nl}"
+            f"<b>Команды</b>{nl}"
+            f"/start — меню{nl}"
+            f"/book — записаться{nl}"
+            f"/prices — цены{nl}"
+            f"/history — история визитов{nl}"
+            f"/contact — написать барберу{nl}"
+            f"/cancel — отменить текущий шаг (не готовую запись){nl}"
+            f"/cancel_booking — отменить подтверждённую запись{nl}"
+            f"/reschedule — перенести запись{nl}"
+            f"/help — эта справка{nl}{nl}"
+            f"Адрес и напоминания — после подтверждения барбером."
         )
     else:
         text = (
-            "Komandas:\n"
-            "/start — izvēlne\n"
-            "/book — pierakstīties\n"
-            "/prices — cenas\n"
-            "/history — vēsture\n"
-            "/contact — sazināties\n"
-            "/cancel — atcelt\n"
-            "/help — palīdzība"
+            f"<b>Palīdzība — pieraksts pie bārddziņa</b>{nl}{nl}"
+            f"<b>Kā pierakstīties</b>{nl}"
+            f"1. /book vai poga «Pierakstīties»{nl}"
+            f"2. Diena → laiks → pakalpojums{nl}"
+            f"3. Pieprasījums iet bārddzinim; gaidiet ✅ vai citu laiku{nl}{nl}"
+            f"<b>Komandas</b>{nl}"
+            f"/start — izvēlne{nl}"
+            f"/book — pierakstīties{nl}"
+            f"/prices — cenas{nl}"
+            f"/history — vēsture{nl}"
+            f"/contact — sazināties{nl}"
+            f"/cancel — atcelt soli{nl}"
+            f"/cancel_booking — atcelt apstiprinātu pierakstu{nl}"
+            f"/reschedule — pārcelt{nl}"
+            f"/help — šī palīdzība"
         )
     await message.answer(text)
 

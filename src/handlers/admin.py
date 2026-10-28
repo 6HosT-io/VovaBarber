@@ -29,6 +29,7 @@ class SettingsStates(StatesGroup):
     edit_slots = State()
     edit_close_text = State()
     edit_sync_interval = State()
+    edit_away_banner = State()
 
 
 def get_admin_ids() -> list[int]:
@@ -134,6 +135,8 @@ def settings_kb() -> InlineKeyboardMarkup:
     from src.services import settings_store as store
     rem_on = store.reminders_enabled()
     rem_label = "🔔 Напоминания: ВКЛ" if rem_on else "🔔 Напоминания: ВЫКЛ"
+    away_on = store.away_banner_enabled()
+    away_label = "🏖 Баннер отпуска: ВКЛ" if away_on else "🏖 Баннер отпуска: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Цены и услуги", callback_data="set:prices")],
         [InlineKeyboardButton(text="🕐 Рабочие часы (текст)", callback_data="set:hours")],
@@ -141,7 +144,9 @@ def settings_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📍 Адрес", callback_data="set:location")],
         [InlineKeyboardButton(text="📞 Телефон в подтверждении", callback_data="set:phone")],
         [InlineKeyboardButton(text="👋 Текст приветствия", callback_data="set:welcome")],
-        [InlineKeyboardButton(text="🏖 Тексты отпуск / блок", callback_data="set:closetxt")],
+        [InlineKeyboardButton(text="🏖 Тексты отпуск / блок (клик по дню)", callback_data="set:closetxt")],
+        [InlineKeyboardButton(text=away_label, callback_data="set:away_toggle")],
+        [InlineKeyboardButton(text="🏖 Текст баннера отпуска (/start,/book)", callback_data="set:away_text")],
         [InlineKeyboardButton(text="🔔 Тексты напоминаний", callback_data="set:reminders")],
         [InlineKeyboardButton(text=rem_label, callback_data="set:rem_toggle")],
         [InlineKeyboardButton(text="🔄 Интервал sync Calendar (сек)", callback_data="set:sync")],
@@ -1377,36 +1382,268 @@ async def cmd_vip_list(message: Message):
     await message.answer(f"<b>VIP ({len(ids)})</b>" + chr(10) + lines)
 
 
-@router.message(Command("away_banner"))
+@router.message(Command("away_banner", "awaybanner"))
 async def cmd_away_banner(message: Message):
+    """Status + on/off + custom texts. Also buttons for toggle."""
     if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для админов.")
         return
     from src.services import settings_store as store
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) == 1:
+    from loguru import logger
+    try:
+        parts = (message.text or "").split(maxsplit=2)
+        # strip @BotName if present on command
+        if parts and "@" in parts[0]:
+            parts[0] = parts[0].split("@", 1)[0]
+
+        if len(parts) >= 2:
+            arg = parts[1].lower().strip()
+            if arg in ("on", "off", "1", "0", "вкл", "выкл", "enable", "disable"):
+                store.set_away_banner_enabled(arg in ("on", "1", "вкл", "enable"))
+                await message.answer(
+                    f"🏖 Баннер отпуска: <b>{'ВКЛ' if store.away_banner_enabled() else 'ВЫКЛ'}</b>"
+                )
+                return
+            if arg in ("ru", "lv"):
+                if len(parts) < 3:
+                    await message.answer(
+                        f"Пришлите: <code>/away_banner {arg} ваш текст</code>" + chr(10)
+                        + "Плейсхолдеры: {start} {end} {reason}"
+                    )
+                    return
+                store.save_away_banner_text(arg, parts[2])
+                await message.answer(f"✅ Текст баннера ({arg}) сохранён.")
+                return
+            await message.answer(
+                "Синтаксис:" + chr(10)
+                + "<code>/away_banner</code> — статус" + chr(10)
+                + "<code>/away_banner on</code> / <code>off</code>" + chr(10)
+                + "<code>/away_banner ru текст</code>" + chr(10)
+                + "<code>/away_banner lv текст</code>"
+            )
+            return
+
         on = store.away_banner_enabled()
-        sample = store.format_away_banner("ru") or "—"
+        info = store.nearest_away_info(21)
+        sample = store.format_away_banner("ru")
         nl = chr(10)
-        await message.answer(
-            f"Баннер отпуска/блока: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>{nl}"
-            f"Сейчас:{nl}{sample}{nl}{nl}"
-            f"/away_banner on|off{nl}"
-            f"/away_banner ru текст…{nl}"
-            f"/away_banner lv текст…"
+        lines = [
+            f"🏖 <b>Баннер отпуска / блока</b>",
+            f"Статус: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>",
+        ]
+        if info:
+            lines.append(
+                f"Ближайшее закрытие: {info.get('reason')} "
+                f"{info.get('start')} → {info.get('end')}"
+            )
+        else:
+            lines.append("Сейчас нет ближайших дней block/vacation в боте.")
+        lines.append("")
+        lines.append("Текст, который увидит клиент на /start и /book (если ВКЛ и есть закрытие):")
+        lines.append(sample or "— (пусто, пока нет закрытых дней или выключено)")
+        lines.append("")
+        lines.append("Команды: /away_banner on|off · /away_banner ru|lv текст")
+        lines.append("Или /settings → «Баннер отпуска».")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Включить" if not on else "✅ Включено",
+                    callback_data="set:away_on",
+                ),
+                InlineKeyboardButton(
+                    text="⏹ Выключить" if on else "⏹ Выключено",
+                    callback_data="set:away_off",
+                ),
+            ],
+            [InlineKeyboardButton(text="⚙️ Открыть /settings", callback_data="set:show")],
+        ])
+        await message.answer(nl.join(lines), reply_markup=kb)
+    except Exception as e:
+        logger.exception(f"/away_banner failed: {e}")
+        await message.answer(f"Ошибка /away_banner: <code>{e}</code>")
+
+
+@router.callback_query(F.data.in_({"set:away_toggle", "set:away_on", "set:away_off"}))
+async def settings_away_toggle(callback: CallbackQuery):
+    if not await require_admin_cb(callback):
+        return
+    from src.services import settings_store as store
+    data = callback.data or ""
+    if data == "set:away_on":
+        store.set_away_banner_enabled(True)
+    elif data == "set:away_off":
+        store.set_away_banner_enabled(False)
+    else:
+        store.set_away_banner_enabled(not store.away_banner_enabled())
+    on = store.away_banner_enabled()
+    try:
+        await callback.message.edit_text(
+            f"🏖 Баннер отпуска на /start и /book: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>",
+            reply_markup=settings_kb(),
         )
-        return
-    arg = parts[1].lower()
-    if arg in ("on", "off", "1", "0", "вкл", "выкл"):
-        store.set_away_banner_enabled(arg in ("on", "1", "вкл"))
-        await message.answer(
-            f"Баннер: <b>{'ВКЛ' if store.away_banner_enabled() else 'ВЫКЛ'}</b>"
+    except Exception:
+        await callback.message.answer(
+            f"🏖 Баннер: <b>{'ВКЛ' if on else 'ВЫКЛ'}</b>",
+            reply_markup=settings_kb(),
         )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "set:away_text")
+async def settings_away_text_menu(callback: CallbackQuery):
+    if not await require_admin_cb(callback):
         return
-    if arg in ("ru", "lv") and len(parts) >= 3:
-        store.save_away_banner_text(arg, parts[2])
-        await message.answer(f"Текст баннера ({arg}) сохранён.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Текст RU", callback_data="set:away_txt:ru")],
+        [InlineKeyboardButton(text="Текст LV", callback_data="set:away_txt:lv")],
+        [InlineKeyboardButton(text="« Назад", callback_data="set:show")],
+    ])
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"Текст баннера на /start и /book (когда есть отпуск/блок рядом).{nl}"
+        f"Плейсхолдеры: <code>{{start}}</code> <code>{{end}}</code> <code>{{reason}}</code>.{nl}"
+        f"Пустой текст = встроенный шаблон.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set:away_txt:"))
+async def settings_away_txt_pick(callback: CallbackQuery, state: FSMContext):
+    if not await require_admin_cb(callback):
         return
-    await message.answer("Синтаксис: /away_banner on|off | /away_banner ru|lv текст")
+    lang = callback.data.split(":")[-1]
+    from src.services import settings_store as store
+    cur = store.get_away_banner_text(lang) or "—"
+    await state.set_state(SettingsStates.edit_away_banner)
+    await state.update_data(away_lang=lang)
+    nl = chr(10)
+    await callback.message.edit_text(
+        f"Текущий баннер ({lang}):{nl}<code>{cur}</code>{nl}{nl}"
+        f"Пришлите новый текст.{nl}/cancel — отмена"
+    )
+    await callback.answer()
+
+
+@router.message(SettingsStates.edit_away_banner)
+async def save_away_banner_setting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").startswith("/cancel"):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=settings_kb())
+        return
+    data = await state.get_data()
+    lang = data.get("away_lang") or "ru"
+    from src.services import settings_store as store
+    store.save_away_banner_text(lang, message.text or "")
+    await state.clear()
+    await message.answer(f"✅ Баннер ({lang}) сохранён.", reply_markup=settings_kb())
+
+
+
+
+
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    """Quick health: bot process + optional Calendar probe latency."""
+    if not is_admin(message.from_user.id):
+        return
+    import time
+    from loguru import logger
+    t0 = time.perf_counter()
+    # local only
+    local_ms = (time.perf_counter() - t0) * 1000
+    cal_line = "Calendar: not configured"
+    try:
+        from src.services import calendar as gcal
+        if gcal.is_configured():
+            t1 = time.perf_counter()
+            d = gcal.now_local().strftime("%d/%m/%Y")
+            slots = gcal.get_available_slots(d, use_cache=False)
+            cal_ms = (time.perf_counter() - t1) * 1000
+            cal_line = (
+                f"Calendar API (today slots, no cache): <b>{cal_ms:.0f} ms</b>, "
+                f"free windows: {len(slots)}"
+            )
+        else:
+            cal_line = "Calendar: not configured"
+    except Exception as e:
+        logger.exception(f"/ping calendar: {e}")
+        cal_line = f"Calendar error: <code>{e}</code>"
+    total = (time.perf_counter() - t0) * 1000
+    nl = chr(10)
+    await message.answer(
+        f"🏓 <b>pong</b>{nl}"
+        f"Bot process: OK{nl}"
+        f"{cal_line}{nl}"
+        f"Total handler: <b>{total:.0f} ms</b>{nl}{nl}"
+        f"<i>Если Calendar &gt; 2000 ms — задержка на /book из Google API нормальна "
+        f"при холодном кэше. Повтор /book обычно быстрее (кэш ~45 с).</i>"
+    )
+
+
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    """Monitoring: long polling alive, last update, loops, pending counts."""
+    if not is_admin(message.from_user.id):
+        return
+    import time
+    from src.services import health
+    from src.services import settings_store as store
+    snap = health.snapshot()
+    nl = chr(10)
+
+    # polling health: last update age
+    last_u = snap.get("last_update_at")
+    if last_u is None:
+        poll_line = "Last Telegram update: <b>none yet</b> (wait for any message)"
+        poll_ok = True  # just started is fine
+    else:
+        age = time.time() - last_u
+        poll_line = (
+            f"Last Telegram update: <b>{snap.get('last_update_ago')}</b> "
+            f"({snap.get('last_update_type') or '—'})"
+        )
+        poll_ok = age < 3600  # soft: idle hour is normal if no traffic
+
+    pending = store.list_pending_bookings() if hasattr(store, "list_pending_bookings") else []
+    try:
+        confirmed = [b for b in store.get_confirmed_bookings() if b.get("status") == "confirmed"]
+    except Exception:
+        confirmed = []
+    try:
+        from src.services import calendar as gcal
+        cal_ok = gcal.is_configured()
+        cal_line = "Calendar: <b>OK</b>" if cal_ok else "Calendar: not configured"
+    except Exception as e:
+        cal_line = f"Calendar: error <code>{e}</code>"
+
+    rem_on = store.reminders_enabled() if hasattr(store, "reminders_enabled") else True
+    lines = [
+        "📊 <b>Bot status</b>",
+        f"Mode: <b>{snap.get('mode') or 'long_polling'}</b>",
+        f"Uptime: <b>{health.format_uptime(snap.get('uptime_sec'))}</b>",
+        poll_line,
+        f"Reminder loop: last tick <b>{snap.get('last_reminder_ago')}</b> "
+        f"({'ON' if rem_on else 'OFF in settings'})",
+        f"Calendar sync: last tick <b>{snap.get('last_sync_ago')}</b>"
+        + (f" · {snap.get('last_sync_note')}" if snap.get("last_sync_note") else ""),
+        cal_line,
+        f"Pending requests: <b>{len(pending)}</b>",
+        f"Active confirmed: <b>{len(confirmed)}</b>",
+    ]
+    if snap.get("last_error"):
+        lines.append(f"Last error: <code>{snap['last_error']}</code>")
+    lines.append("")
+    lines.append(
+        "<i>Long polling is fine if process is up and /ping responds. "
+        "No updates for a long time is normal without clients. "
+        "Reminder tick every ~60s; calendar sync every few minutes.</i>"
+    )
+    await message.answer(nl.join(lines))
+
 
 
 @router.message(Command("pending"))
