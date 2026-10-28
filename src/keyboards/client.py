@@ -32,23 +32,35 @@ def language_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def day_selection_kb(lang: str = "ru") -> InlineKeyboardMarkup:
-    """Hide only blocked/vacation days. Capacity limit removed — calendar slots decide."""
+def day_selection_kb(lang: str = "ru", *, vip: bool = False) -> InlineKeyboardMarkup:
+    """
+    Today/tomorrow/day_after. Closed days marked (недоступно).
+    VIP still sees them as bookable callbacks so they can request a review.
+    """
+    from datetime import timedelta
+    from src.services import calendar as gcal
     from src.services import settings_store as store
-    from datetime import datetime, timedelta
 
     builder = InlineKeyboardBuilder()
-    today = datetime.now().date()
+    today = gcal.now_local().date()
     options = [
         ("today", 0, "Сегодня" if lang == "ru" else "Šodien"),
         ("tomorrow", 1, "Завтра" if lang == "ru" else "Rīt"),
         ("day_after", 2, "Послезавтра" if lang == "ru" else "Parīt"),
     ]
+    na_suffix = " (недоступно)" if lang == "ru" else " (nav pieejams)"
+    vip_suffix = " ⭐" if vip else ""
     for key, offset, label in options:
         d = (today + timedelta(days=offset)).strftime("%d/%m/%Y")
-        if store.is_blocked(d):
-            continue
-        builder.button(text=label, callback_data=f"day:{key}")
+        closed = store.is_blocked(d)
+        ok, reason = gcal.day_is_bookable(d)
+        if vip and closed:
+            # VIP may open closed day for a review request
+            builder.button(text=label + vip_suffix, callback_data=f"day:{key}")
+        elif ok:
+            builder.button(text=label, callback_data=f"day:{key}")
+        else:
+            builder.button(text=label + na_suffix, callback_data=f"day:na:{key}:{reason}")
     other = "Другая дата" if lang == "ru" else "Cita datums"
     builder.button(text=other, callback_data="day:other")
     builder.adjust(1)
@@ -59,19 +71,29 @@ _SLOT_KB_CACHE: dict = {}
 _SLOT_KB_TTL = 45.0
 
 
-def slot_selection_kb(slots: list[str], lang: str = "ru") -> InlineKeyboardMarkup:
-    """Available time slots; short in-memory cache of markup for same slot list."""
+def slot_selection_kb(
+    slots: list[str],
+    lang: str = "ru",
+    *,
+    busy_slots: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    """
+    Free slots for everyone. busy_slots only for VIP (⭐ prefix) — never shown to normals.
+    """
     import time
-    key = (lang, tuple(slots))
+    busy_set = set(busy_slots or [])
+    key = (lang, tuple(slots), tuple(sorted(busy_set)))
     hit = _SLOT_KB_CACHE.get(key)
     if hit and time.time() - hit[0] < _SLOT_KB_TTL:
         return hit[1]
     builder = InlineKeyboardBuilder()
     for s in slots:
-        builder.button(text=s, callback_data=f"slot:{s}")
+        if s in busy_set:
+            builder.button(text=f"⭐ {s}", callback_data=f"slot:{s}")
+        else:
+            builder.button(text=s, callback_data=f"slot:{s}")
     back = "« Другой день" if lang == "ru" else "« Cita diena"
     builder.button(text=back, callback_data="slot:back")
-    # 3 per row for times, back full width
     n = len(slots)
     row_sizes = [3] * (n // 3)
     if n % 3:
@@ -80,7 +102,6 @@ def slot_selection_kb(slots: list[str], lang: str = "ru") -> InlineKeyboardMarku
     builder.adjust(*row_sizes)
     markup = builder.as_markup()
     _SLOT_KB_CACHE[key] = (time.time(), markup)
-    # bound cache size
     if len(_SLOT_KB_CACHE) > 40:
         oldest = sorted(_SLOT_KB_CACHE.items(), key=lambda x: x[1][0])[:10]
         for k, _ in oldest:
