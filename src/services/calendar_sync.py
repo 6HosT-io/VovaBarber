@@ -130,6 +130,10 @@ async def sync_once(bot: Bot) -> dict:
 
 async def calendar_sync_loop(bot: Bot):
     logger.info(f"Calendar sync loop started (default every {CHECK_INTERVAL_SEC}s)")
+    try:
+        from src.services import health as _health
+    except Exception:
+        _health = None
     await asyncio.sleep(20)
     while True:
         try:
@@ -139,8 +143,19 @@ async def calendar_sync_loop(bot: Bot):
             interval = CHECK_INTERVAL_SEC
         try:
             stats = await sync_once(bot)
+            note = f"checked={stats.get('checked', 0)} del={stats.get('deleted', 0)} moved={stats.get('moved', 0)}"
+            if _health:
+                try:
+                    _health.mark_sync_tick(note)
+                except Exception:
+                    pass
             if stats.get("deleted") or stats.get("moved"):
                 logger.info(f"Calendar sync: {stats}")
         except Exception as e:
             logger.error(f"Calendar sync loop error: {e}")
+            if _health:
+                try:
+                    _health.mark_error(f"sync: {e}")
+                except Exception:
+                    pass
         await asyncio.sleep(interval)

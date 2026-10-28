@@ -136,7 +136,16 @@ async def check_and_send(bot: Bot):
 
 async def reminder_loop(bot: Bot):
     logger.info("Reminder loop started")
+    try:
+        from src.services import health as _health
+    except Exception:
+        _health = None
     while True:
+        try:
+            if _health:
+                _health.mark_reminder_tick()
+        except Exception:
+            pass
         try:
             from src.services import settings_store as store
             if store.reminders_enabled():
