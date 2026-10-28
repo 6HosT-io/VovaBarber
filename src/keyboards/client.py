@@ -35,7 +35,11 @@ def language_kb() -> InlineKeyboardMarkup:
 def day_selection_kb(lang: str = "ru", *, vip: bool = False) -> InlineKeyboardMarkup:
     """
     Today/tomorrow/day_after. Closed days marked (недоступно).
-    VIP still sees them as bookable callbacks so they can request a review.
+
+    Performance: block/vacation is local (instant). Full Calendar slot probe
+    only for *today* (need past-slot filter). Tomorrow / day-after stay open
+    until the client picks them; emptiness is checked on click / slot fetch.
+    VIP may still open closed days for a review request.
     """
     from datetime import timedelta
     from src.services import calendar as gcal
@@ -53,14 +57,24 @@ def day_selection_kb(lang: str = "ru", *, vip: bool = False) -> InlineKeyboardMa
     for key, offset, label in options:
         d = (today + timedelta(days=offset)).strftime("%d/%m/%Y")
         closed = store.is_blocked(d)
-        ok, reason = gcal.day_is_bookable(d)
         if vip and closed:
-            # VIP may open closed day for a review request
             builder.button(text=label + vip_suffix, callback_data=f"day:{key}")
-        elif ok:
-            builder.button(text=label, callback_data=f"day:{key}")
+            continue
+        if closed:
+            builder.button(text=label + na_suffix, callback_data=f"day:na:{key}:blocked")
+            continue
+        # Live Calendar only for today (expensive API); other days open until picked
+        if offset == 0:
+            ok, reason = gcal.day_is_bookable(d)
+            if ok:
+                builder.button(text=label, callback_data=f"day:{key}")
+            else:
+                builder.button(
+                    text=label + na_suffix,
+                    callback_data=f"day:na:{key}:{reason}",
+                )
         else:
-            builder.button(text=label + na_suffix, callback_data=f"day:na:{key}:{reason}")
+            builder.button(text=label, callback_data=f"day:{key}")
     other = "Другая дата" if lang == "ru" else "Cita datums"
     builder.button(text=other, callback_data="day:other")
     builder.adjust(1)
