@@ -193,6 +193,146 @@ def save_calendar_sync_interval(sec: int):
     save_runtime(runtime)
 
 
+
+# ---------- VIP clients (manual by Telegram user id) ----------
+
+def get_vip_ids() -> set[int]:
+    runtime = get_runtime()
+    raw = runtime.get("vip_user_ids", []) or []
+    out = set()
+    for x in raw:
+        try:
+            out.add(int(x))
+        except Exception:
+            pass
+    return out
+
+
+def is_vip(user_id: int) -> bool:
+    try:
+        return int(user_id) in get_vip_ids()
+    except Exception:
+        return False
+
+
+def add_vip(user_id: int) -> bool:
+    """Returns True if newly added."""
+    runtime = get_runtime()
+    ids = [int(x) for x in (runtime.get("vip_user_ids") or []) if str(x).lstrip("-").isdigit()]
+    uid = int(user_id)
+    if uid in ids:
+        return False
+    ids.append(uid)
+    runtime["vip_user_ids"] = ids
+    save_runtime(runtime)
+    return True
+
+
+def remove_vip(user_id: int) -> bool:
+    runtime = get_runtime()
+    ids = [int(x) for x in (runtime.get("vip_user_ids") or []) if str(x).lstrip("-").isdigit()]
+    uid = int(user_id)
+    if uid not in ids:
+        return False
+    runtime["vip_user_ids"] = [x for x in ids if x != uid]
+    save_runtime(runtime)
+    return True
+
+
+def away_banner_enabled() -> bool:
+    runtime = get_runtime()
+    return bool(runtime.get("away_banner_enabled", True))
+
+
+def set_away_banner_enabled(on: bool):
+    runtime = get_runtime()
+    runtime["away_banner_enabled"] = bool(on)
+    save_runtime(runtime)
+
+
+def get_away_banner_text(lang: str = "ru") -> str:
+    """Optional custom banner; empty = built-in default."""
+    runtime = get_runtime()
+    key = "away_banner_ru" if lang != "lv" else "away_banner_lv"
+    return (runtime.get(key) or "").strip()
+
+
+def save_away_banner_text(lang: str, text: str):
+    runtime = get_runtime()
+    key = "away_banner_ru" if lang != "lv" else "away_banner_lv"
+    runtime[key] = text
+    save_runtime(runtime)
+
+
+def nearest_away_info(within_days: int = 14) -> dict | None:
+    """
+    If any day in [today, today+within_days) is vacation/block, return summary.
+    {reason, start, end, sample_date}
+    """
+    from datetime import datetime, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Europe/Riga")).date()
+    except Exception:
+        today = datetime.now().date()
+    first = None
+    last = None
+    reason = None
+    for i in range(max(1, within_days)):
+        d = today + timedelta(days=i)
+        key = d.strftime("%d/%m/%Y")
+        r = get_day_close_reason(key)
+        if not r:
+            if first and last:
+                break
+            continue
+        if first is None:
+            first = key
+            reason = r
+        last = key
+    if not first:
+        return None
+    return {"reason": reason or "block", "start": first, "end": last or first, "sample_date": first}
+
+
+def format_away_banner(lang: str = "ru") -> str | None:
+    """Text for /start and /book when banner on and nearby closed days exist."""
+    if not away_banner_enabled():
+        return None
+    info = nearest_away_info(21)
+    if not info:
+        return None
+    custom = get_away_banner_text(lang)
+    if custom:
+        return (
+            custom
+            .replace("{start}", info["start"])
+            .replace("{end}", info["end"])
+            .replace("{reason}", info["reason"])
+        )
+    if info["reason"] == "vacation":
+        if lang == "lv":
+            return (
+                f"🏖 Bārddzinis ir atvaļinājumā / prom "
+                f"no <b>{info['start']}</b> līdz <b>{info['end']}</b>.\n"
+                f"Parastā pieraksts šajās dienās nav pieejama; VIP var nosūtīt pieprasījumu."
+            )
+        return (
+            f"🏖 Барбер в отпуске / отсутствует "
+            f"с <b>{info['start']}</b> по <b>{info['end']}</b>.\n"
+            f"Обычная запись на эти дни недоступна; VIP может отправить запрос на рассмотрение."
+        )
+    if lang == "lv":
+        return (
+            f"🔒 Dažas dienas tuvākajā laikā ir slēgtas "
+            f"(no <b>{info['start']}</b>). Izvēlieties citu dienu."
+        )
+    return (
+        f"🔒 Ближайшие дни частично закрыты "
+        f"(с <b>{info['start']}</b>). Выберите другой день или дождитесь открытия."
+    )
+
+
 def get_working_hours() -> dict:
     runtime = get_runtime()
     if "working_hours" in runtime:

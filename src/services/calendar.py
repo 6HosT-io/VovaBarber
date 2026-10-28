@@ -800,6 +800,60 @@ def get_available_slots(
     return out
 
 
+
+def get_slot_grid(
+    date_str: str,
+    *,
+    include_busy: bool = False,
+    duration_min: int | None = None,
+    step_min: int | None = None,
+    day_start: str | None = None,
+    day_end: str | None = None,
+    limit: int = 64,
+) -> list[tuple[str, bool]]:
+    """
+    Full grid of HH:MM in working window.
+    Returns list of (time_str, is_busy).
+    When include_busy=False, only free slots (same as get_available_slots).
+    When include_busy=True (VIP), free + busy times that fall on the grid.
+    """
+    import time as _time
+    try:
+        from src.services import settings_store as _store
+        ss = _store.get_slot_settings()
+    except Exception:
+        ss = {}
+    dur = duration_min if duration_min is not None else int(ss.get("duration_min") or DEFAULT_DURATION_MIN)
+    step = step_min if step_min is not None else int(ss.get("step_min") or SLOT_STEP_MIN)
+    sh, sm = _parse_hhmm(day_start or ss.get("start") or DEFAULT_START)
+    eh, em = _parse_hhmm(day_end or ss.get("end") or DAY_END)
+    day_start_m = _minutes(sh, sm)
+    day_end_m = _minutes(eh, em)
+    busy = get_busy_intervals(date_str)
+    min_start_m = day_start_m
+    base_day = parse_date_ddmmyyyy(date_str)
+    if base_day:
+        nl = now_local()
+        if nl.year == base_day.year and nl.month == base_day.month and nl.day == base_day.day:
+            min_start_m = max(
+                day_start_m,
+                nl.hour * 60 + nl.minute + SLOT_LEAD_MIN,
+            )
+    out: list[tuple[str, bool]] = []
+    cursor = day_start_m
+    while cursor + dur <= day_end_m:
+        if cursor >= min_start_m:
+            free = _slot_fits(cursor, dur, busy, day_end_m)
+            if free:
+                out.append((_fmt_minutes(cursor), False))
+            elif include_busy:
+                out.append((_fmt_minutes(cursor), True))
+        cursor += step
+        if len(out) >= limit:
+            break
+    return out
+
+
 def slots_keyboard_rows(slots: list[str], prefix: str = "slot") -> list[list[str]]:
     return slots
 
