@@ -27,6 +27,28 @@ logger.info(f"ADMIN_IDS={os.getenv('ADMIN_IDS')!r} ADMIN_GROUP_ID={os.getenv('AD
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from typing import Callable, Dict, Any, Awaitable
+
+
+class UpdateTrackerMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        try:
+            from src.services import health
+            et = type(event).__name__
+            health.mark_update(et)
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+
 PUBLIC_COMMANDS = [
     BotCommand(command="start", description="Главное меню / Galvenā izvēlne"),
     BotCommand(command="book", description="Записаться / Pierakstīties"),
@@ -54,7 +76,14 @@ ADMIN_EXTRA = [
     BotCommand(command="edit_id", description="Править запись"),
     BotCommand(command="backup", description="Бэкап настроек"),
     BotCommand(command="pending", description="Очередь заявок"),
+    BotCommand(command="away_banner", description="Баннер отпуска вкл/выкл"),
+    BotCommand(command="vip_list", description="Список VIP"),
+    BotCommand(command="vip_add", description="Добавить VIP по id"),
+    BotCommand(command="vip_del", description="Убрать VIP"),
+
     BotCommand(command="week", description="Неделя / загрузка"),
+    BotCommand(command="ping", description="Проверка скорости / Calendar"),
+    BotCommand(command="status", description="Статус polling / loops"),
 ]
 
 
@@ -89,6 +118,7 @@ async def set_bot_commands(bot: Bot):
 def register_handlers():
     from src.handlers import admin
     from src.handlers import common
+    dp.update.middleware(UpdateTrackerMiddleware())
     dp.include_router(admin.router)
     dp.include_router(common.router)
     logger.info("Routers registered: admin, common")
@@ -96,12 +126,14 @@ def register_handlers():
 
 async def on_startup():
     await set_bot_commands(bot)
+    from src.services import health
+    health.mark_started("long_polling")
     # Background reminders (24h + morning)
     from src.services.reminders import reminder_loop
     from src.services.calendar_sync import calendar_sync_loop
     asyncio.create_task(reminder_loop(bot))
     asyncio.create_task(calendar_sync_loop(bot))
-    logger.info("Bot started successfully (reminders loop on)")
+    logger.info("Bot started successfully (reminders loop on, health tracking on)")
 
 
 async def main():
